@@ -1,0 +1,10 @@
+/target
+/exports
+*.bin
+*.BIN
+*.rom
+*.ROM
+*.ori
+*.ORI
+*.xdf
+*.XDF
