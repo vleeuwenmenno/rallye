@@ -1,4 +1,6 @@
 mod analysis;
+mod edit;
+mod emu;
 mod gui;
 
 use analysis::*;
@@ -6,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-rallye — read-only IAW8P EPROM / XDF inspector
+rallye — IAW8P EPROM / XDF inspector (reads dump files, never writes them)
 
 USAGE:
   rallye [DIR]                       open the GUI on DIR (default: ..)

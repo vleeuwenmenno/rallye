@@ -71,6 +71,43 @@ pub fn scan_dir(dir: &Path) -> Result<Inventory, String> {
     Ok(inv)
 }
 
+pub fn canon(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+impl Inventory {
+    /// Validate and append one explicit dump from any folder. Returns its index; a file already
+    /// loaded (same canonical path) selects the existing entry and never replaces its bytes.
+    /// Second value is true when the file was newly added. Errors leave the inventory unchanged.
+    pub fn import_dump(&mut self, path: &Path) -> Result<(usize, bool), String> {
+        if !matches!(ext_lower(path).as_str(), "bin" | "rom" | "ori") {
+            return Err(format!("{}: not a dump (expected .bin, .rom or .ori)", path.display()));
+        }
+        let c = canon(path);
+        if let Some(i) = self.dumps.iter().position(|d| canon(&d.path) == c) {
+            return Ok((i, false));
+        }
+        let mut d = load_dump(&c)?;
+        d.path = c;
+        self.dumps.push(d);
+        Ok((self.dumps.len() - 1, true))
+    }
+
+    /// Same for an XDF: it must parse before it is added.
+    pub fn import_xdf(&mut self, path: &Path) -> Result<(usize, bool), String> {
+        if ext_lower(path) != "xdf" {
+            return Err(format!("{}: not an XDF (expected .xdf)", path.display()));
+        }
+        let c = canon(path);
+        load_xdf(&c)?;
+        if let Some(i) = self.xdfs.iter().position(|x| canon(x) == c) {
+            return Ok((i, false));
+        }
+        self.xdfs.push(c);
+        Ok((self.xdfs.len() - 1, true))
+    }
+}
+
 // ---------------------------------------------------------------- minimal XML DOM
 
 #[derive(Debug, Default, Clone)]
@@ -179,6 +216,9 @@ pub struct Axis {
     pub units: String,
     pub indexcount: Option<u64>,
     pub labels: Vec<String>,
+    /// True only when every LABEL had a unique numeric `index`; labels are then placed by index
+    /// (gaps stay empty). Otherwise document order is kept but must not be trusted for plotting.
+    pub labels_indexed: bool,
     pub equation: String,
     pub embedded_attrs: Vec<(String, String)>,
 }
@@ -228,11 +268,30 @@ impl Xdf {
 }
 
 fn axis(n: &Node) -> Axis {
+    let raw: Vec<(Option<u64>, String)> = n
+        .all("LABEL")
+        .map(|l| (l.attr("index").and_then(|i| parse_num(i).ok()), l.attr("value").unwrap_or("").to_string()))
+        .collect();
+    let mut ix: Vec<u64> = raw.iter().filter_map(|(i, _)| *i).collect();
+    ix.sort_unstable();
+    ix.dedup();
+    // shortcut: gap-fill cap of 4096 guards absurd indexes, raise if a real XDF needs more.
+    let labels_indexed = !raw.is_empty() && ix.len() == raw.len() && ix.last().is_some_and(|&m| m < 4096);
+    let labels = if labels_indexed {
+        let mut v = vec![String::new(); *ix.last().unwrap() as usize + 1];
+        for (i, val) in &raw {
+            v[i.unwrap() as usize] = val.clone();
+        }
+        v
+    } else {
+        raw.into_iter().map(|(_, v)| v).collect()
+    };
     Axis {
         id: n.attr("id").unwrap_or("").into(),
         units: n.text_of("units"),
         indexcount: n.child("indexcount").and_then(|c| parse_num(&c.text).ok()),
-        labels: n.all("LABEL").map(|l| l.attr("value").unwrap_or("").to_string()).collect(),
+        labels,
+        labels_indexed,
         equation: n.child("MATH").and_then(|m| m.attr("equation")).unwrap_or("").into(),
         embedded_attrs: n.child("EMBEDDEDDATA").map(|e| e.attrs.clone()).unwrap_or_default(),
     }
@@ -431,8 +490,189 @@ pub fn stats(cells: &[u8]) -> Option<Stats> {
     })
 }
 
+/// Target minus baseline as i16, so 0x7F-0x80 (signed) and 255-0 (unsigned) never overflow.
+pub fn cell_delta(target: u8, base: u8, signed: bool) -> i16 {
+    if signed { as_signed(target) as i16 - as_signed(base) as i16 } else { target as i16 - base as i16 }
+}
+
 pub fn cells<'a>(data: &'a [u8], l: &Layout) -> &'a [u8] {
     &data[l.offset as usize..l.end() as usize]
+}
+
+/// RPM x load surface for one table. `cells` stay row-major: row = RPM (Y), column = load (X).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlotData {
+    pub rpm: Vec<f64>,
+    pub load: Vec<f64>,
+    /// XDF X-axis units verbatim (for example "Load index"); never relabelled as %.
+    pub load_units: String,
+    pub cells: Vec<u8>,
+}
+
+/// Axis labels as numbers: must be complete (`n` labels), indexed, finite and strictly increasing.
+fn numeric_axis(a: &Axis, n: u64, name: &str) -> Result<Vec<f64>, String> {
+    if !a.labels_indexed {
+        return Err(format!("{name} axis labels lack unique LABEL index values"));
+    }
+    if a.labels.len() as u64 != n {
+        return Err(format!("{} {name} labels for {n} cells", a.labels.len()));
+    }
+    let v = a
+        .labels
+        .iter()
+        .map(|s| s.trim().parse::<f64>().ok().filter(|v| v.is_finite()).ok_or(format!("{name} label {s:?} is not a finite number")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if v.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(format!("{name} labels are not strictly increasing"));
+    }
+    Ok(v)
+}
+
+/// Surface only for >=2x2 tables whose XDF Y axis says RPM and both axes have complete, indexed,
+/// finite, strictly increasing labels. Never falls back to row/column indexes.
+pub fn plot_data(item: &Item, l: &Layout, cells: &[u8]) -> Result<PlotData, String> {
+    if l.rows < 2 || l.cols < 2 {
+        return Err(format!("surface needs at least 2x2 cells, table is {}x{}", l.rows, l.cols));
+    }
+    let y = item.y.as_ref().ok_or("no Y axis in XDF")?;
+    if !y.units.trim().eq_ignore_ascii_case("rpm") {
+        return Err(format!("Y axis units are {:?}, not RPM", y.units));
+    }
+    let rpm = numeric_axis(y, l.rows, "Y")?;
+    let x = item.x.as_ref().ok_or("no X axis in XDF")?;
+    let load = numeric_axis(x, l.cols, "X")?;
+    if cells.len() as u64 != l.rows * l.cols {
+        return Err("cell count does not match layout".into());
+    }
+    Ok(PlotData { rpm, load, load_units: x.units.trim().to_string(), cells: cells.to_vec() })
+}
+
+// ---------------------------------------------------------------- 16-bit scalar (read-only)
+
+/// A single 16-bit XDFCONSTANT. Offsets are a file-offset hypothesis like `Layout`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarLayout {
+    pub address: u64,
+    pub offset: u64,
+    /// XDF `lsbfirst` / mmedtypeflags 0x02: bytes are little-endian.
+    pub little_endian: bool,
+    /// What the XDF claims (flags 0x01); display interpretation stays a viewer choice.
+    pub xdf_claims_signed: bool,
+}
+
+/// Layout of a 16-bit constant. Anything else (tables, other widths, float, strides, unknown
+/// flag bits, dimensions other than 1x1) is rejected with a reason, never guessed.
+pub fn scalar_layout(item: &Item, xdf: &Xdf, file_len: u64) -> Result<ScalarLayout, String> {
+    if item.kind != Kind::Constant {
+        return Err("not an XDFCONSTANT".into());
+    }
+    let bits = match item.eattr("mmedelementsizebits").or(xdf.default("datasizeinbits")) {
+        Some(v) => parse_num(v)?,
+        None => return Err("element size not given".into()),
+    };
+    if bits != 16 {
+        return Err(format!("{bits}-bit constant: only 16-bit scalars are decoded"));
+    }
+    if xdf.default("float").is_some_and(|f| f != "0") {
+        return Err("DEFAULTS float is set: float layout unsupported".into());
+    }
+    let flags_raw = item.eattr("mmedtypeflags");
+    let flags = flags_raw.map(parse_num).transpose()?;
+    if flags.is_some_and(|f| f & !0x03 != 0) {
+        return Err(format!("mmedtypeflags {} has bits other than 0x01 (signed) / 0x02 (LSB first)", flags_raw.unwrap_or("")));
+    }
+    let (little_endian, xdf_claims_signed) = match flags {
+        Some(f) => (f & 2 != 0, f & 1 != 0),
+        None => (xdf.default("lsbfirst") == Some("1"), xdf.default("signed") == Some("1")),
+    };
+    for k in ["mmedmajorstridebits", "mmedminorstridebits"] {
+        let s = item.eattr(k).map(parse_num).transpose()?.unwrap_or(0);
+        if s != 0 {
+            return Err(format!("{k}={s}: non-contiguous stride unsupported"));
+        }
+    }
+    if count_attr(item, "mmedrowcount")? != 1 || count_attr(item, "mmedcolcount")? != 1 {
+        return Err("constant with rows/cols other than 1x1 is not a scalar".into());
+    }
+    let address = parse_num(item.eattr("mmedaddress").ok_or("no mmedaddress in EMBEDDEDDATA")?)?;
+    let offset = resolve_offset(address, &xdf.base)?;
+    let end = offset.checked_add(2).ok_or("offset + size overflows")?;
+    if end > file_len {
+        return Err(format!("out of range: needs file bytes 0x{offset:X}..0x{end:X} but file is 0x{file_len:X} ({file_len}) bytes"));
+    }
+    Ok(ScalarLayout { address, offset, little_endian, xdf_claims_signed })
+}
+
+/// Raw bytes in file order and the unsigned word they decode to. None if out of bounds.
+pub fn scalar_read(l: &ScalarLayout, data: &[u8]) -> Option<([u8; 2], u16)> {
+    let o = usize::try_from(l.offset).ok()?;
+    let b: [u8; 2] = data.get(o..o.checked_add(2)?)?.try_into().ok()?;
+    Some((b, if l.little_endian { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) }))
+}
+
+/// Target minus baseline as i32, wide enough for any pair of 16-bit words in either interpretation.
+pub fn scalar_delta(target: u16, base: u16, signed: bool) -> i32 {
+    if signed { target as i16 as i32 - base as i16 as i32 } else { target as i32 - base as i32 }
+}
+
+/// The ONE documented conversion, RPM = 15000000 / X (unsigned word X). Any other equation, units
+/// other than RPM, an XDF signed claim or X = 0 yields an explicit reason; nothing is executed.
+pub fn scalar_rpm(item: &Item, l: &ScalarLayout, word: u16) -> Result<f64, String> {
+    let eq: String = item.equation.split_whitespace().collect();
+    if eq != "15000000/X" || !item.units.trim().eq_ignore_ascii_case("rpm") {
+        return Err(format!("equation {:?} (units {:?}) is not the documented 15000000/X RPM pattern", item.equation, item.units));
+    }
+    if l.xdf_claims_signed {
+        return Err("XDF claims signed storage; 15000000/X is documented for unsigned".into());
+    }
+    if word == 0 {
+        return Err("raw value 0: division by zero".into());
+    }
+    Ok(15_000_000.0 / word as f64)
+}
+
+// ---------------------------------------------------------------- 2D line data
+
+/// Native 2D chart input. Cells stay row-major (row = XDF Y axis, column = XDF X axis).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineData {
+    /// Horizontal positions, numeric axis values (or 0..n when `index_fallback` is set).
+    pub x: Vec<f64>,
+    /// Horizontal axis title: XDF axis units verbatim, or "sample index".
+    pub x_title: String,
+    /// Why numeric axis labels were not usable; the chart then uses the sample index.
+    pub index_fallback: Option<String>,
+    /// One name per line (the other axis label); empty for a single line.
+    pub names: Vec<String>,
+    /// What `names` are: XDF X-axis units verbatim.
+    pub name_title: String,
+    /// lines[s][i] = raw byte of line s at horizontal position i.
+    pub lines: Vec<Vec<u8>>,
+}
+
+/// Curves and small maps as lines: 1xN uses the X axis horizontally with one line; N>=2 rows use
+/// the Y axis horizontally with one line per column. 1x1 is a single value, not a line.
+pub fn line_data(item: &Item, l: &Layout, cells: &[u8]) -> Result<LineData, String> {
+    if l.rows == 1 && l.cols == 1 {
+        return Err("single value: nothing to draw as a line".into());
+    }
+    if cells.len() as u64 != l.rows * l.cols {
+        return Err("cell count does not match layout".into());
+    }
+    let (rows, cols) = (l.rows as usize, l.cols as usize);
+    let (axis, n, name, lines, names) = if rows == 1 {
+        (item.x.as_ref(), l.cols, "X", vec![cells.to_vec()], vec![])
+    } else {
+        let lines = (0..cols).map(|c| (0..rows).map(|r| cells[r * cols + c]).collect()).collect();
+        let names = if cols > 1 { (0..cols).map(|c| item.x.as_ref().and_then(|a| a.labels.get(c).cloned()).unwrap_or_else(|| c.to_string())).collect() } else { vec![] };
+        (item.y.as_ref(), l.rows, "Y", lines, names)
+    };
+    let (x, x_title, index_fallback) = match axis.ok_or_else(|| format!("no {name} axis in XDF")).and_then(|a| numeric_axis(a, n, name).map(|v| (v, a.units.trim().to_string()))) {
+        Ok((v, u)) => (v, if u.is_empty() { format!("XDF {name} axis (no units given)") } else { u }, None),
+        Err(e) => ((0..n).map(|i| i as f64).collect(), "sample index".to_string(), Some(e)),
+    };
+    let name_title = item.x.as_ref().map(|a| a.units.trim().to_string()).filter(|u| !u.is_empty()).unwrap_or_else(|| "XDF X axis".into());
+    Ok(LineData { x, x_title, index_fallback, names, name_title, lines })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -609,7 +849,7 @@ mod tests {
 <XDFAXIS id="y"><indexcount>2</indexcount></XDFAXIS>
 <XDFAXIS id="z"><EMBEDDEDDATA mmedtypeflags="0x01" mmedaddress="0x20" mmedelementsizebits="8" mmedrowcount="2" mmedcolcount="3" mmedmajorstridebits="0" mmedfuture="7"/><MATH equation="X*2"/></XDFAXIS>
 </XDFTABLE>
-<XDFCONSTANT uniqueid="0x30"><title>Rev</title><EMBEDDEDDATA mmedelementsizebits="16" mmedaddress="0x30"/><MATH equation="15000000/X"/></XDFCONSTANT>
+<XDFCONSTANT uniqueid="0x30"><title>Rev</title><units>RPM</units><EMBEDDEDDATA mmedelementsizebits="16" mmedaddress="0x30"/><MATH equation="15000000/X"/></XDFCONSTANT>
 </XDFFORMAT>"#;
 
     fn xdf() -> Xdf {
@@ -651,6 +891,218 @@ mod tests {
     }
 
     #[test]
+    fn surface_axes_orientation_and_invalid_axes() {
+        let x = xdf();
+        let mut t = x.items[0].clone(); // 2 rows x 3 cols
+        let l = layout(&t, &x, 0x100).unwrap();
+        // Build any axis by swapping the fixture's Y axis; `.y` then holds it (id is irrelevant here).
+        let ax = |n: usize, units: &str, labels: &[(&str, &str)]| {
+            let body: String = labels.iter().map(|(i, v)| format!("<LABEL index=\"{i}\" value=\"{v}\"/>")).collect();
+            let src = XDF.replace(
+                "<XDFAXIS id=\"y\"><indexcount>2</indexcount></XDFAXIS>",
+                &format!("<XDFAXIS id=\"y\"><units>{units}</units><indexcount>{n}</indexcount>{body}</XDFAXIS>"),
+            );
+            parse_xdf(Path::new("t.xdf"), &src).unwrap().items[0].y.clone()
+        };
+        let cells = [1u8, 2, 0x7F, 0x80, 0xFF, 0x00];
+        t.y = ax(2, "RPM", &[("1", "6000"), ("0", "800")]); // out of order but indexed
+        t.x = ax(3, "Load index", &[("0", "11"), ("1", "22"), ("2", "100")]);
+        let p = plot_data(&t, &l, &cells).unwrap();
+        assert_eq!(p.rpm, [800.0, 6000.0]); // uneven spacing kept as numbers
+        assert_eq!(p.load, [11.0, 22.0, 100.0]);
+        assert_eq!(p.load_units, "Load index"); // verbatim, not %
+        assert_eq!(p.cells, cells); // row-major: row = RPM, column = load
+        let good_x = t.x.clone();
+        for bad in [
+            ax(2, "RPM", &[("0", "800"), ("2", "6000")]), // sparse: row 1 label empty
+            ax(2, "RPM", &[("0", "800")]),                // incomplete
+            ax(2, "RPM", &[("0", "800"), ("1", "800")]),  // not strictly increasing
+            ax(2, "RPM", &[("0", "800"), ("1", "NaN")]),  // not finite
+            ax(2, "kPa", &[("0", "800"), ("1", "900")]),  // not RPM
+            ax(2, "RPM", &[("0", "800"), ("0", "900")]),  // duplicate index
+            None,
+        ] {
+            t.y = bad;
+            assert!(plot_data(&t, &l, &cells).is_err());
+        }
+        t.y = ax(2, "RPM", &[("0", "800"), ("1", "6000")]);
+        for bad in [
+            x.items[0].x.clone(),                                                     // labels "a","b","c"
+            ax(3, "Load index", &[("0", "11"), ("1", "22")]),           // count != columns
+            ax(3, "Load index", &[("0", "11"), ("1", "33"), ("2", "22")]), // not monotonic
+            ax(3, "Load index", &[("0", "11"), ("1", "inf"), ("2", "33")]), // not finite
+            None,
+        ] {
+            t.x = bad;
+            assert!(plot_data(&t, &l, &cells).is_err());
+        }
+        t.x = good_x;
+        assert!(plot_data(&t, &l, &cells).is_ok());
+        let one_col = Layout { cols: 1, rows: 6, ..l.clone() };
+        assert!(plot_data(&t, &one_col, &cells).unwrap_err().contains("2x2"));
+    }
+
+    /// Fixture with the constant's EMBEDDEDDATA attributes (and optional DEFAULTS) replaced.
+    fn const_xdf(attrs: &str, equation: &str) -> Xdf {
+        let src = XDF
+            .replace("mmedelementsizebits=\"16\" mmedaddress=\"0x30\"", attrs)
+            .replace("equation=\"15000000/X\"", &format!("equation=\"{equation}\""));
+        parse_xdf(Path::new("t.xdf"), &src).unwrap()
+    }
+
+    #[test]
+    fn scalar_16bit_endian_signed_and_flags() {
+        let mut file = vec![0u8; 0x40];
+        file[0x20..0x22].copy_from_slice(&[0x07, 0x88]);
+        let x = const_xdf("mmedelementsizebits=\"16\" mmedaddress=\"0x30\"", "15000000/X");
+        let it = &x.items[1];
+        let l = scalar_layout(it, &x, file.len() as u64).unwrap();
+        assert_eq!((l.address, l.offset, l.little_endian, l.xdf_claims_signed), (0x30, 0x20, false, false));
+        assert_eq!(scalar_read(&l, &file), Some(([0x07, 0x88], 0x0788))); // big endian default
+        assert_eq!(scalar_rpm(it, &l, 0x0788).unwrap().round(), 7_780.0); // 15000000/1928, matches the XDF description (unverified)
+        // little-endian via flag 0x02, signed claim via 0x03
+        let x = const_xdf("mmedelementsizebits=\"16\" mmedtypeflags=\"0x02\" mmedaddress=\"0x30\"", "15000000/X");
+        let l = scalar_layout(&x.items[1], &x, 0x40).unwrap();
+        assert!(l.little_endian && !l.xdf_claims_signed);
+        assert_eq!(scalar_read(&l, &file).unwrap().1, 0x8807);
+        let x = const_xdf("mmedelementsizebits=\"16\" mmedtypeflags=\"0x03\" mmedaddress=\"0x30\"", "15000000/X");
+        let l = scalar_layout(&x.items[1], &x, 0x40).unwrap();
+        assert!(l.little_endian && l.xdf_claims_signed);
+        assert!(scalar_rpm(&x.items[1], &l, 5).unwrap_err().contains("signed"));
+        // signed reinterpretation of the same word
+        assert_eq!(0x8807u16 as i16, -30713);
+        // unknown flag bits, float, strides, 8-bit, dimensions, address outside the file
+        for bad in [
+            "mmedelementsizebits=\"16\" mmedtypeflags=\"0x04\" mmedaddress=\"0x30\"",
+            "mmedelementsizebits=\"16\" mmedmajorstridebits=\"8\" mmedaddress=\"0x30\"",
+            "mmedelementsizebits=\"16\" mmedrowcount=\"2\" mmedaddress=\"0x30\"",
+            "mmedelementsizebits=\"32\" mmedaddress=\"0x30\"",
+            "mmedelementsizebits=\"16\"",
+        ] {
+            let x = const_xdf(bad, "15000000/X");
+            assert!(scalar_layout(&x.items[1], &x, 0x100).is_err(), "{bad}");
+        }
+        let x = const_xdf("mmedelementsizebits=\"16\" mmedaddress=\"0x30\"", "15000000/X");
+        assert!(scalar_layout(&x.items[1], &x, 0x21).unwrap_err().contains("out of range")); // 0x20..0x22 > 0x21
+        assert!(scalar_layout(&x.items[1], &x, 0x22).is_ok());
+        assert!(scalar_layout(&x.items[0], &x, 0x100).is_err()); // tables are never scalars
+        let l = scalar_layout(&x.items[1], &x, 0x22).unwrap();
+        assert_eq!(scalar_read(&l, &file[..0x21]), None); // short data: no panic
+        // DEFAULTS lsbfirst applies when the item has no flags
+        let src = XDF.replace("signed=\"0\" />", "signed=\"0\" lsbfirst=\"1\" />");
+        let x = parse_xdf(Path::new("t.xdf"), &src).unwrap();
+        assert!(scalar_layout(&x.items[1], &x, 0x40).unwrap().little_endian);
+    }
+
+    #[test]
+    fn scalar_delta_and_rpm_formula() {
+        assert_eq!(scalar_delta(0xFFFF, 0, false), 65_535);
+        assert_eq!(scalar_delta(0, 0xFFFF, false), -65_535);
+        assert_eq!(scalar_delta(0x7FFF, 0x8000, true), 65_535); // 32767 - (-32768)
+        assert_eq!(scalar_delta(0x8000, 0x7FFF, true), -65_535);
+        let x = const_xdf("mmedelementsizebits=\"16\" mmedaddress=\"0x30\"", "15000000/X");
+        let it = &x.items[1];
+        let l = scalar_layout(it, &x, 0x100).unwrap();
+        assert!(scalar_rpm(it, &l, 0).unwrap_err().contains("division by zero"));
+        assert_eq!(scalar_rpm(it, &l, 1).unwrap(), 15_000_000.0);
+        for eq in ["X*2", "15000000/X+1", "15000001/X", "system(1)"] {
+            let x = const_xdf("mmedelementsizebits=\"16\" mmedaddress=\"0x30\"", eq);
+            let l = scalar_layout(&x.items[1], &x, 0x100).unwrap();
+            assert!(scalar_rpm(&x.items[1], &l, 7).is_err(), "{eq}");
+        }
+        let src = XDF.replace("<units>RPM</units><EMBEDDEDDATA", "<units>ms</units><EMBEDDEDDATA");
+        let x = parse_xdf(Path::new("t.xdf"), &src).unwrap();
+        assert!(scalar_rpm(&x.items[1], &l, 7).is_err()); // right equation, units not RPM
+        let x = const_xdf("mmedelementsizebits=\"16\" mmedaddress=\"0x30\"", " 15000000 / X ");
+        assert!(scalar_rpm(&x.items[1], &l, 7).is_ok()); // whitespace only
+    }
+
+    fn lay(rows: u64, cols: u64) -> Layout {
+        Layout { address: 0, offset: 0, rows, cols, elem_bits: 8, xdf_claims_signed: false }
+    }
+
+    fn axis_of(units: &str, labels: &[&str]) -> Option<Axis> {
+        let l: String = labels.iter().enumerate().map(|(i, v)| format!("<LABEL index=\"{i}\" value=\"{v}\"/>")).collect();
+        let src = XDF.replace(
+            "<XDFAXIS id=\"y\"><indexcount>2</indexcount></XDFAXIS>",
+            &format!("<XDFAXIS id=\"y\"><units>{units}</units>{l}</XDFAXIS>"),
+        );
+        parse_xdf(Path::new("t.xdf"), &src).unwrap().items[0].y.clone()
+    }
+
+    #[test]
+    fn line_data_curves_and_maps() {
+        let mut it = xdf().items[0].clone();
+        // 1xN: X axis horizontal, one line, uneven spacing kept
+        it.x = axis_of("Load index", &["6", "12", "100"]);
+        let ld = line_data(&it, &lay(1, 3), &[1, 2, 3]).unwrap();
+        assert_eq!((ld.x.clone(), ld.x_title.as_str(), ld.index_fallback.clone()), (vec![6., 12., 100.], "Load index", None));
+        assert_eq!(ld.lines, vec![vec![1, 2, 3]]);
+        assert!(ld.names.is_empty());
+        // Nx1: Y axis horizontal (RPM), one line
+        it.y = axis_of("RPM", &["800", "1000", "6000"]);
+        let ld = line_data(&it, &lay(3, 1), &[9, 8, 7]).unwrap();
+        assert_eq!((ld.x, ld.x_title.as_str()), (vec![800., 1000., 6000.], "RPM"));
+        assert_eq!(ld.lines, vec![vec![9, 8, 7]]);
+        // NxM row-major: rows horizontal, one line per column, named by X labels
+        it.x = axis_of("Load index", &["11", "22"]);
+        let ld = line_data(&it, &lay(3, 2), &[1, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(ld.lines, vec![vec![1, 3, 5], vec![2, 4, 6]]);
+        assert_eq!((ld.names.clone(), ld.name_title.as_str()), (vec!["11".into(), "22".into()], "Load index"));
+        assert_eq!(ld.x_title, "RPM"); // Y units, not load
+        // unusable axis: explicit sample-index fallback, never relabelled
+        it.y = axis_of("RPM", &["800", "800", "6000"]);
+        let ld = line_data(&it, &lay(3, 1), &[9, 8, 7]).unwrap();
+        assert_eq!((ld.x, ld.x_title.as_str()), (vec![0., 1., 2.], "sample index"));
+        assert!(ld.index_fallback.unwrap().contains("increasing"));
+        it.y = None;
+        assert!(line_data(&it, &lay(3, 1), &[9, 8, 7]).unwrap().index_fallback.unwrap().contains("no Y axis"));
+        // 1x1 and bad cell counts are errors
+        assert!(line_data(&it, &lay(1, 1), &[1]).unwrap_err().contains("single value"));
+        assert!(line_data(&it, &lay(2, 2), &[1]).is_err());
+    }
+
+    #[test]
+    fn imports_dedupe_validate_and_keep_state() {
+        let dir = std::env::temp_dir().join(format!("rallye-import-{}", std::process::id()));
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("one.BIN"), [1u8, 2]).unwrap();
+        fs::write(b.join("one.BIN"), [9u8, 9, 9]).unwrap(); // same name, other folder
+        fs::write(b.join("notes.txt"), "x").unwrap();
+        fs::write(b.join("empty.bin"), "").unwrap();
+        fs::write(b.join("bad.xdf"), "<foo/>").unwrap();
+        fs::write(b.join("ok.xdf"), XDF).unwrap();
+        let mut inv = scan_dir(&a).unwrap();
+        let original = inv.dumps[0].bytes.clone();
+        // new file from another folder is appended and distinguished by path
+        assert_eq!(inv.import_dump(&b.join("one.BIN")), Ok((1, true)));
+        assert_eq!(inv.dumps[1].bytes, [9, 9, 9]);
+        assert_ne!(inv.dumps[0].path, inv.dumps[1].path);
+        // already loaded (also via a non-canonical spelling): selects existing, bytes untouched, no growth
+        assert_eq!(inv.import_dump(&a.join("..").join("a").join("one.BIN")), Ok((0, false)));
+        assert_eq!(inv.import_dump(&b.join("one.BIN")), Ok((1, false)));
+        assert_eq!((inv.dumps.len(), inv.dumps[0].bytes.clone()), (2, original));
+        // wrong extension / empty / missing: error, inventory unchanged
+        for bad in [b.join("notes.txt"), b.join("empty.bin"), b.join("missing.bin")] {
+            assert!(inv.import_dump(&bad).is_err(), "{}", bad.display());
+        }
+        assert!(inv.import_dump(&b.join("ok.xdf")).is_err());
+        assert_eq!(inv.dumps.len(), 2);
+        // XDF: wrong extension, parse failure, ok, duplicate
+        assert!(inv.import_xdf(&b.join("one.BIN")).unwrap_err().contains(".xdf"));
+        assert!(inv.import_xdf(&b.join("bad.xdf")).is_err());
+        assert!(inv.xdfs.is_empty());
+        assert_eq!(inv.import_xdf(&b.join("ok.xdf")), Ok((0, true)));
+        assert_eq!(inv.import_xdf(&b.join("ok.xdf")), Ok((0, false)));
+        fs::write(b.join("ok.xdf"), "broken XML").unwrap();
+        assert!(inv.import_xdf(&b.join("ok.xdf")).is_err());
+        assert_eq!(inv.xdfs.len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn rejects_unsupported_layouts() {
         let x = xdf();
         let mut t = x.items[0].clone();
@@ -688,6 +1140,16 @@ mod tests {
         assert!(parse_xdf(Path::new("x"), "<XDFFORMAT><XDFHEADER>").unwrap_err().contains("never closed"));
         assert!(parse_xdf(Path::new("x"), "<foo/>").unwrap_err().contains("XDFFORMAT"));
         assert!(parse_xdf(Path::new("x"), "<XDFFORMAT></XDFHEADER>").is_err());
+    }
+
+    #[test]
+    fn cell_delta_extremes() {
+        assert_eq!(cell_delta(255, 0, false), 255);
+        assert_eq!(cell_delta(0, 255, false), -255);
+        assert_eq!(cell_delta(0x7F, 0x80, true), 255); // 127 - (-128)
+        assert_eq!(cell_delta(0x80, 0x7F, true), -255);
+        assert_eq!(cell_delta(0x80, 0x7F, false), 1);
+        assert_eq!(cell_delta(9, 9, true), 0);
     }
 
     #[test]
