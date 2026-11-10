@@ -20,10 +20,10 @@ ZEROS = bytes(65536)
 
 
 def request(action="run", image=ZEROS, **fields):
-    base = {"version": 3, "action": action, "simulator": "ucsim_m68hc11",
+    base = {"version": 4, "action": action, "simulator": "ucsim_m68hc11",
             "sha256": hashlib.sha256(image).hexdigest(), "image": image.hex()}
     if action == "run":
-        base.update(profile="strict", budget=100, inputs=None, checkpoint=None)
+        base.update(profile="strict", budget=100, inputs=None, checkpoint=None, checkpoint_inputs=None)
     else:
         base.update(row=7, column=3, row_fraction=192, column_fraction=64, edits=[])
     base.update(fields)
@@ -68,10 +68,23 @@ class Validation(unittest.TestCase):
         self.rejects(request(profile="h2", inputs={**fp.DEFAULT_INPUTS, "portd_in": 64}), "portd_in must be")
         self.rejects(request(profile="h2", inputs={**fp.DEFAULT_INPUTS, "adc": [0] * 7}), "adc must be")
         self.rejects(request(profile="h2", inputs={**fp.DEFAULT_INPUTS, "adc": [256] + [0] * 7}), "adc must be")
+        self.rejects(request(profile="h2", inputs={**fp.DEFAULT_INPUTS, "crank_rpm": 9001}), "crank_rpm must be")
+        self.rejects(request(profile="h2", inputs={**fp.DEFAULT_INPUTS, "porta_in": 0x01}), "PA0 and PA7 carry")
+        # A checkpoint must name the inputs it was sealed with, and only a checkpoint may.
+        self.rejects(request(profile="h2", inputs=fp.DEFAULT_INPUTS, checkpoint_inputs=fp.DEFAULT_INPUTS), "checkpoint_inputs")
+        self.rejects(request(profile="h2", inputs=fp.DEFAULT_INPUTS, checkpoint={"state": "", "digest": ""}), "checkpoint_inputs")
+
+    def test_live_input_changes(self):
+        """Every H2 input except the EEPROM power-up fill may change at a chunk boundary."""
+        changed = {**fp.DEFAULT_INPUTS, "crank_rpm": 900, "adc": [0x80, 0x80, 0x40] + [0x80] * 5}
+        self.assertEqual(fp.changed_inputs("h2", fp.DEFAULT_INPUTS, changed), ["adc", "crank_rpm"])
+        with self.assertRaisesRegex(ValueError, "eeprom_fill cannot change"):
+            fp.changed_inputs("h2", fp.DEFAULT_INPUTS, {**fp.DEFAULT_INPUTS, "eeprom_fill": 0})
+        self.assertEqual(fp.changed_inputs("h1", None, None), [])
 
     def test_checkpoint_is_bound_to_session_identity(self):
-        sealed = fp.seal("a" * 64, "h2", fp.DEFAULT_INPUTS, "IAW8P-STATE 1\nend\n")
-        self.assertEqual(fp.unseal("a" * 64, "h2", fp.DEFAULT_INPUTS, sealed), "IAW8P-STATE 1\nend\n")
+        sealed = fp.seal("a" * 64, "h2", fp.DEFAULT_INPUTS, "IAW8P-STATE 2\nend\n")
+        self.assertEqual(fp.unseal("a" * 64, "h2", fp.DEFAULT_INPUTS, sealed), "IAW8P-STATE 2\nend\n")
         for sha, profile, inputs in (("b" * 64, "h2", fp.DEFAULT_INPUTS), ("a" * 64, "h1", None),
                                      ("a" * 64, "h2", {**fp.DEFAULT_INPUTS, "in1060": 0x20})):
             with self.assertRaisesRegex(ValueError, "another source, profile or input set"):
@@ -79,7 +92,9 @@ class Validation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checkpoint must be"):
             fp.unseal("a" * 64, "h2", fp.DEFAULT_INPUTS, {"state": sealed["state"]})
         with self.assertRaisesRegex(ValueError, "Malformed simulator checkpoint"):
-            fp.parse_checkpoint("IAW8P-STATE 1\nf reg 2 1\nend")
+            fp.parse_checkpoint("IAW8P-STATE 2\nf reg 2 1\nend")
+        with self.assertRaisesRegex(ValueError, "Malformed simulator checkpoint"):
+            fp.parse_checkpoint("IAW8P-STATE 1\nend")  # older layout without crank and capture state
 
     def test_edits_only_inside_the_table(self):
         for edit in ([0x91AA, 1], [0x9283, 1], [0x91AB, 256], [0x91AB], [0x91AB, True]):
@@ -285,9 +300,10 @@ class Simulator(unittest.TestCase):
         self.assertEqual((stop, ram[0]), (("read", 0x1060), 0))
 
     def test_h2_supplied_inputs_and_board_readback(self):
-        h2 = dict(profile="h2", inputs={**fp.DEFAULT_INPUTS, "in1060": 0xA5, "in1080": 0x3C, "porta_in": 0x87})
+        h2 = dict(profile="h2", inputs={**fp.DEFAULT_INPUTS, "in1060": 0xA5, "in1080": 0x3C, "porta_in": 0x06})
         _, _, ram = self.snippet("b610609750b610809751b6100097528606b710404fb61040975386f0b71000b610009754", 15, **h2)
-        # $1060, $1080 supplied; PORTA reads inputs PA0-2/PA7 plus output pins (low after reset); latch read-back.
+        # $1060, $1080 supplied; PORTA reads PA1/PA2 as supplied, PA0/PA7 from the crank signal (wheel at rest in
+        # the gap: high), plus output pins (low after reset); latch read-back.
         self.assertEqual(list(ram[:5]), [0xA5, 0x3C, 0x87, 0x06, 0x87 | 0x70])
         self.assertEqual(self.snippet("b61060", 1, "h2", {**fp.DEFAULT_INPUTS})[0], None)
         self.assertEqual(self.snippet("b61050", 1, "h2")[0], ("read", 0x1050))  # never written: no read-back value
@@ -362,12 +378,21 @@ class Simulator(unittest.TestCase):
         # A session continues from the returned checkpoint; another input set may not reuse it.
         first = bridge(json.dumps(request(image=data, simulator=UCSIM, profile="h2", budget=1000, inputs=fp.DEFAULT_INPUTS)))
         nxt = bridge(json.dumps(request(image=data, simulator=UCSIM, profile="h2", budget=1000, inputs=fp.DEFAULT_INPUTS,
-                                        checkpoint=first["checkpoint"])))
-        self.assertEqual((nxt["start"], nxt["executed"]), (1000, 2000))
-        other = {**fp.DEFAULT_INPUTS, "in1060": 0x20}
+                                        checkpoint=first["checkpoint"], checkpoint_inputs=fp.DEFAULT_INPUTS)))
+        self.assertEqual((nxt["start"], nxt["executed"], nxt["inputs_changed"]), (1000, 2000, []))
+        other = {**fp.DEFAULT_INPUTS, "in1060": 0x20, "crank_rpm": 900}
+        # Claiming the checkpoint was sealed with other inputs is refused ...
         stale = bridge(json.dumps(request(image=data, simulator=UCSIM, profile="h2", budget=1000, inputs=other,
-                                          checkpoint=first["checkpoint"])))
+                                          checkpoint=first["checkpoint"], checkpoint_inputs=other)))
         self.assertIn("another source, profile or input set", stale["error"])
+        # ... while naming its real inputs applies the new ones from that instruction on.
+        live = bridge(json.dumps(request(image=data, simulator=UCSIM, profile="h2", budget=1000, inputs=other,
+                                         checkpoint=first["checkpoint"], checkpoint_inputs=fp.DEFAULT_INPUTS)))
+        self.assertEqual((live["start"], live["executed"], live["inputs_changed"], live["inputs"]),
+                         (1000, 2000, ["crank_rpm", "in1060"], other))
+        again = bridge(json.dumps(request(image=data, simulator=UCSIM, profile="h2", budget=10, inputs=other,
+                                          checkpoint=live["checkpoint"], checkpoint_inputs=fp.DEFAULT_INPUTS)))
+        self.assertIn("another source, profile or input set", again["error"])  # the new checkpoint carries the new inputs
 
     def test_h2_reaches_repeated_foreground_work_and_timer_interrupts(self):
         """Engine-stopped scheduler: main loop, timer ISRs entered and returned, SP stable; both $1060 bit-5 states."""
@@ -398,7 +423,7 @@ class Simulator(unittest.TestCase):
             b = fp.run(UCSIM, data, profile, total - split, inputs, a["checkpoint"])
             unpack = lambda r: fp.unseal(hashlib.sha256(data).hexdigest(), profile, inputs, r["checkpoint"])
             self.assertEqual(unpack(one), unpack(b))
-            keep = lambda r: {k: v for k, v in r.items() if k not in ("start", "budget", "samples", "checkpoint")}
+            keep = lambda r: {k: v for k, v in r.items() if k not in ("start", "budget", "samples", "trace", "checkpoint")}
             self.assertEqual(keep(one), keep(b))
             self.assertEqual((b["start"], b["samples"][0][0], b["samples"][-1]), (split, split, one["samples"][-1]))
         # H1 still stops before $A86A when continued from a checkpoint; no checkpoint past a blocker.
@@ -418,6 +443,141 @@ class Simulator(unittest.TestCase):
         self.assertTrue(all(b - a > 300 for a, b in zip(loops, loops[1:])), loops)  # steady progress per chunk
         self.assertEqual((r["loop"]["sp_min"], r["loop"]["sp_max"]), (0x27FF, 0x27FF))
 
+
+def firmware_rpm(period):
+    """$429B: IDIV 58594/$BB, FDIV remainder/$BB; $D1:$D2 = low quotient byte : high fraction byte."""
+    q, r = divmod(58594, period)
+    return ((q & 0xFF) << 8) | (((r << 16) // period) >> 8)
+
+
+@unittest.skipUnless(UCSIM and shutil.which(UCSIM) and all(d.is_file() for d in DUMPS),
+                     "needs UCSIM (make emulator-setup) and both identified dumps in DUMP_DIR")
+class Crank(unittest.TestCase):
+    """Simulated 60-2 crank signal on PA7/PA0 and the firmware's own response to it (H2)."""
+
+    snippet = Simulator.snippet
+
+    def test_pulse_accumulator_and_input_capture(self):
+        # 6000 rpm: one half-tooth per 2e6 / 12000 = 166.7 E cycles. From rest in the gap, falling edges come
+        # at E cycles ceil(166.7 k) for k = 1, 3: 167 and 500; the rising edge between at 334. TCNT runs at E/1 after reset.
+        crank = dict(profile="h2", inputs={**fp.DEFAULT_INPUTS, "crank_rpm": 6000})
+        setup = "8640b71026" "8602b71021" "86feb71027"  # PACTL PAEN falling; TCTL2 IC3 falling; PACNT=$FE
+        read = "b610259750" "b610279751" "b610239752" "fc1014dd53"
+        stop, _, ram = self.snippet(setup + "3d" * 55 + read, 6 + 55 + 8, **crank)
+        self.assertIsNone(stop)
+        # Two counted edges: $FE -> $FF -> $00 sets PAOVF and PAIF; IC3 captured TCNT at the second falling edge.
+        self.assertEqual((ram[0] & 0x30, ram[1], ram[2] & 0x01, int.from_bytes(ram[3:5], "big")), (0x30, 0x00, 0x01, 500))
+        # PEDGE=1 and EDG3A: only the rising edge at E cycle 334 counts and is captured.
+        setup = "8650b71026" "8601b71021" "86feb71027"
+        _, _, ram = self.snippet(setup + "3d" * 55 + read, 6 + 55 + 8, **crank)
+        self.assertEqual((ram[0] & 0x30, ram[1], ram[2] & 0x01, int.from_bytes(ram[3:5], "big")), (0x10, 0xFF, 0x01, 334))
+        # Stopped wheel: no edge, and TIC3 has no defined content yet.
+        stop, _, ram = self.snippet(setup + "3d" * 55 + "b610279751", 6 + 55 + 2, "h2")
+        self.assertEqual((stop, ram[1]), (None, 0xFE))
+        self.assertEqual(self.snippet("fc1014", 1, "h2")[0], ("register_read", 0x1014))
+        # Gated time accumulation is not modelled while a crank signal exists.
+        self.assertEqual(self.snippet("8660b71026", 2, **crank)[0], ("register_write", 0x1026))
+
+    def test_unknown_division_remainder_may_not_be_used(self):
+        self.assertIsNone(self.snippet("ce000002" "8f" "ce1234" "dd50", 5, "h2")[0])  # IDIV /0, XGDX, LDX #
+        self.assertEqual(self.snippet("ce000002" "4c", 3, "h2")[0], ("flags", 0x2404))  # INCA reads the remainder
+        self.assertEqual(self.snippet("ce000002" "8f" "08", 4, "h2")[0], ("flags", 0x2405))  # INX after XGDX
+
+    def test_multiple_unknown_inputs_do_not_erase_existing_taint(self):
+        for serial in ("102a", "102f"):
+            # Undefined remainder moved into X must survive a separate unknown A load.
+            self.assertEqual(self.snippet("ce0000028fb6" + serial + "4fff0050", 6, "h2")[0],
+                             ("register_read", int(serial, 16)))
+            # An unknown B load must not hide the still-unknown A value.
+            self.assertEqual(self.snippet("b6" + serial + "f6" + serial + "5f9750", 4, "h2")[0],
+                             ("register_read", int(serial, 16)))
+
+    def test_interrupt_preserves_unknown_flags_after_stacked_accumulator_overwrite(self):
+        commands = ["reset", "CC=0xd0", "SP=0x25f0", "iaw8p_profile=2",
+                    *fp.input_commands("h2", fp.DEFAULT_INPUTS),
+                    "set memory rom 0x2400 0x0e 0xb6 0x10 0x2a 0x26 0x00 0x01",
+                    "set memory rom 0x2420 0x86 0x80 0xb7 0x10 0x25 0x86 0x01 0xb7 0x25 0xea 0x3b",
+                    "set memory rom 0xffde 0x24 0x20",
+                    "set hardware iaw8p reg 0x24 0x80", "set hardware iaw8p reg 0x25 0x80",
+                    "pc 0x2400", "step 8", "expr 7177499", "info hardware iaw8p"]
+        out, _ = fp.run_simulator(UCSIM, DUMPS[0].read_bytes(), commands)
+        stop = fp.IAW8P_STOP.search(out.split("7177499", 1)[1])
+        self.assertIsNotNone(stop)
+        self.assertEqual((stop[1], int(stop[2], 16)), ("flags", 0x2404))
+
+    def session(self, data, plan, inputs=None):
+        """Run (inputs-update, chunks) steps as one session, changing inputs at chunk boundaries."""
+        before, cp, out = inputs or {**fp.DEFAULT_INPUTS}, None, []
+        for update, n in plan:
+            for _ in range(n):
+                now = {**before, **update}
+                r = fp.run(UCSIM, data, "h2", fp.MAX_RUN, now, cp, checkpoint_inputs=before if cp else None)
+                self.assertIsNone(r["blocker"], r["blocker"])
+                out.append(r)
+                before, cp = now, r["checkpoint"]
+        return out
+
+    @staticmethod
+    def ram(r, address):
+        internal, external = bytes.fromhex(r["ram"]["internal"]), bytes.fromhex(r["ram"]["external"])
+        return internal[address] if address < 0x100 else external[address - 0x2000]
+
+    def word(self, r, address):
+        return self.ram(r, address) << 8 | self.ram(r, address + 1)
+
+    def test_firmware_rpm_follows_commanded_speed_on_both_dumps(self):
+        for dump in DUMPS:
+            data = dump.read_bytes()
+            runs = self.session(data, [({}, 1), ({"crank_rpm": 250}, 2), ({"crank_rpm": 900}, 2),
+                                       ({"crank_rpm": 3000}, 2), ({"crank_rpm": 6500}, 2), ({"crank_rpm": 0}, 2)])
+            self.assertEqual([r["start"] for r in runs], [k * fp.MAX_RUN for k in range(len(runs))])  # never reset
+            for r in runs[1:-2]:
+                rpm, period = r["inputs"]["crank_rpm"], self.word(r, 0xBB)
+                # The firmware times 30 teeth (180 degrees) at 2 us per TCNT count: 15e6 / rpm counts ...
+                self.assertLessEqual(abs(period - 15_000_000 / rpm), 2, (dump.name, rpm, period))
+                # ... and divides that period itself; $D1 is its result, not an echo of the input.
+                self.assertEqual(self.word(r, 0xD1), firmware_rpm(period))
+                self.assertLessEqual(abs(self.word(r, 0xD1) - rpm), max(2, rpm // 1000))
+                self.assertTrue(self.ram(r, 0xAD) & 0x10)  # gap verified at tooth 1 ($9381)
+                crank = r["crank"]
+                self.assertGreater(crank["edges"], 0)
+                self.assertIn("PAOV", {name for _, name, _, _, _ in r["interrupts"]})
+            # Crank stopped: the firmware times out on its own ($BB = $FFFF, $D1 = 0, stall regime $AE bit 0).
+            stopped = runs[-1]
+            self.assertEqual((self.word(stopped, 0xBB), self.word(stopped, 0xD1), self.ram(stopped, 0xAE) & 1), (0xFFFF, 0, 1))
+            self.assertEqual(self.ram(stopped, 0xAD) & 0x10, 0)
+            self.assertEqual(hashlib.sha256(dump.read_bytes()).hexdigest(), fp.check_source(data))
+
+    def test_throttle_candidate_reaches_firmware_values(self):
+        data = DUMPS[0].read_bytes()
+        an2 = lambda v: {"adc": [0x80, 0x80, v, 0x80, 0x80, 0x80, 0x80, 0x80]}
+        runs = self.session(data, [({"crank_rpm": 900}, 2), (an2(0x40), 1), (an2(0xD0), 1), (an2(0x90), 1)])
+        values = [(self.ram(r, 0x2003), self.ram(r, 0xC6), self.ram(r, 0x200F)) for r in runs[1:]]
+        # Raw AN2 is copied to $2003 (A/D sequence $4034/$4108) and validated into $C6 and $200F ($5FAF) ...
+        self.assertEqual(values, [(0x80,) * 3, (0x40,) * 3, (0xD0,) * 3, (0x90,) * 3])
+        # ... $AA bit 6 is set near the learned closed endpoint $0E, bit 7 near the open one $0D ($7A1E).
+        self.assertEqual([self.ram(r, 0xAA) & 0x40 for r in runs[1:3]], [0, 0x40])
+        self.assertEqual([self.ram(r, 0xAA) & 0x80 for r in runs[1:]], [0, 0, 0x80, 0])
+        self.assertEqual((self.ram(runs[-1], 0x0E), self.ram(runs[-1], 0x0D)), (data[0x88FE], data[0x88FD]))
+        self.assertEqual(runs[2]["inputs_changed"], ["adc"])
+
+    def test_crank_session_chunks_equal_one_run(self):
+        data = DUMPS[1].read_bytes()
+        inputs = {**fp.DEFAULT_INPUTS, "crank_rpm": 1234}
+        warm = fp.run(UCSIM, data, "h2", 300_000, inputs)
+        one = fp.run(UCSIM, data, "h2", 600_000, inputs, warm["checkpoint"])
+        a = fp.run(UCSIM, data, "h2", 277_777, inputs, warm["checkpoint"])
+        b = fp.run(UCSIM, data, "h2", 600_000 - 277_777, inputs, a["checkpoint"])
+        self.assertNotEqual(a["crank"]["residual"], 0)  # split inside a half tooth
+        unpack = lambda r: fp.unseal(hashlib.sha256(data).hexdigest(), "h2", inputs, r["checkpoint"])
+        self.assertEqual(unpack(one), unpack(b))
+        self.assertEqual((one["crank"], one["trace"][-1]), (b["crank"], b["trace"][-1]))
+
+    def test_engine_stopped_baseline_is_unchanged(self):
+        r = fp.run(UCSIM, DUMPS[0].read_bytes(), "h2", fp.MAX_RUN, fp.DEFAULT_INPUTS)
+        irq = {name: n for _, name, _, n, _ in r["interrupts"]}
+        self.assertEqual((r["loop"]["count"], irq), (424, {"RTI": 961, "TOF": 30}))
+        self.assertEqual((r["crank"]["edges"], r["crank"]["tooth"], r["crank"]["level"]), (0, None, 1))
 
 if __name__ == "__main__":
     unittest.main()

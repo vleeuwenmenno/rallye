@@ -117,7 +117,7 @@ index 62a2770..2a591e2 100644
    virtual void make_memories(void);
    virtual void setup_ccr(void);
 diff --git i/src/core/motorola.src/m68hc11.cc w/src/core/motorola.src/m68hc11.cc
-index b6b7e1f..152728b 100644
+index b6b7e1f..a747e62 100644
 --- i/src/core/motorola.src/m68hc11.cc
 +++ w/src/core/motorola.src/m68hc11.cc
 @@ -39,16 +39,18 @@ Software Foundation, 59 Temple Place - Suite 330, Boston, MA
@@ -141,15 +141,32 @@ index b6b7e1f..152728b 100644
    /* 4 */ 2, 0, 0, 2, 2, 0, 2, 2, 2, 2, 2, 0, 2, 2, 0, 2,
    /* 5 */ 2, 0, 0, 2, 2, 0, 2, 2, 2, 2, 2, 0, 2, 2, 0, 2,
    /* 6 */ 6, 0, 0, 6, 6, 0, 6, 6, 6, 6, 6, 0, 6, 6, 3, 6,
-@@ -80,7 +82,7 @@ i8_t p18ticks11[256]= {
+@@ -76,11 +78,11 @@ i8_t p18ticks11[256]= {
+   /* 8 */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 4,
+   /* 9 */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0,
+   /* a */ 5, 5, 5, 7, 5, 5, 5, 5, 5, 5, 5, 5, 7, 7, 6, 6,
+-  /* b */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0,
++  /* b */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,  /* CPY ext: 7 (was listed at BD) */
    /* c */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0,
    /* d */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 5,
-   /* e */ 5, 5, 5, 7, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 5, 6,
+-  /* e */ 5, 5, 5, 7, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 5, 6,
 -  /* f */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 6
++  /* e */ 5, 5, 5, 7, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6,  /* LDY ,Y: 6 */
 +  /* f */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 6  /* LDY ext: 6 */
  };
  
  i8_t pcdticks11[256]= {
+@@ -119,8 +121,8 @@ i8_t p1aticks11[256]= {
+   /* b */ 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+   /* c */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+   /* d */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-  /* e */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0,
+-  /* f */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0
++  /* e */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 6,  /* STY ,X: 6 (was listed at FE) */
++  /* f */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+ };
+ 
+ 
 @@ -186,6 +188,7 @@ cl_m68hcbase::print_regs(class cl_console_base *con)
  cl_m68hc11::cl_m68hc11(class cl_sim *asim):
    cl_m68hcbase(asim)
@@ -211,7 +228,68 @@ index b6b7e1f..152728b 100644
    r|= m;
    dest.W(r);
    if (!r) f|= flagZ;
-@@ -715,7 +719,7 @@ CL11::ASLD(t_mem code)
+@@ -641,18 +645,23 @@ CL11::cp16(class cl_cell16 &dest, u16_t op)
+ int
+ CL11::IDIV(t_mem code)
+ {
+-  u16_t q, r;
++  // Quotient and remainder both from the original operands (the X register is written last).
++  u16_t d= rD, x= rX, q;
+   u8_t f= rF & ~(flagZ|flagV|flagC);
+-  if (rX == 0)
++  if (x == 0)
+     {
++      // Manual: quotient $FFFF, remainder indeterminate; nothing may depend on D afterwards.
++      if (board)
++	board->dead_acc= 'D';	// manual: remainder indeterminate; must not be used
+       q= 0xffff;
+-      r= rX;
+       f|= flagC;
++      cX.W(q);
+     }
+   else
+     {
+-      cX.W(q= rD/rX);
+-      cD.W(r= rD%rX);
++      q= d / x;
++      cD.W(d % x);
++      cX.W(q);
+     }
+   if (!q) f|= flagZ;
+   cF.W(f);
+@@ -663,20 +672,23 @@ CL11::IDIV(t_mem code)
+ int
+ CL11::FDIV(t_mem code)
+ {
+-  u32_t n= rD << 16;
+-  u16_t q, r;
++  u32_t n= (u32_t)rD << 16;
++  u16_t d= rD, x= rX, q;
+   u8_t f= rF & ~(flagZ|flagV|flagC);
+-  if( rX <= rD) f|= flagV;
+-  if (rX == 0)
++  if (x <= d)
+     {
++      // Manual: overflow (V) or division by zero (C) gives quotient $FFFF, remainder indeterminate.
++      if (board)
++	board->dead_acc= 'D';	// manual: remainder indeterminate; must not be used
++      f|= flagV | (x == 0 ? flagC : 0);
+       q= 0xffff;
+-      r= rX;
+-      f|= flagC;
++      cX.W(q);
+     }
+   else
+     {
+-      cX.W(q= n/rX);
+-      cD.W(r= n%rX);
++      q= n / x;
++      cD.W(n % x);
++      cX.W(q);
+     }
+   if (!q) f|= flagZ;
+   cF.W(f);
+@@ -715,7 +727,7 @@ CL11::ASLD(t_mem code)
  int
  CL11::ABxy(t_mem code)
  {
@@ -220,7 +298,7 @@ index b6b7e1f..152728b 100644
    return resGO;
  }
  
-@@ -792,4 +796,1323 @@ CL11::BRN(t_mem code)
+@@ -792,4 +804,1580 @@ CL11::BRN(t_mem code)
  }
    
  
@@ -300,7 +378,9 @@ index b6b7e1f..152728b 100644
 +  v->init();
 +  uc->vars->add(v= new cl_var("iaw8p_eeprom_fill", cfg, 8 + IAW8P_ADC, "H2 input: internal EEPROM content at power-up, one byte value (256: not supplied)"));
 +  v->init();
-+  for (int k= 5; k <= 8; k++)
++  uc->vars->add(v= new cl_var("iaw8p_crank_rpm", cfg, 9 + IAW8P_ADC, "H2 input: commanded crank speed of the simulated 60-2 wheel on PA7/PA0, rpm at the assumed 2 MHz E clock (0: stopped; above 9000: no crank signal)"));
++  v->init();
++  for (int k= 5; k <= 9; k++)
 +    cfg_set(k + IAW8P_ADC, IAW8P_NOT_SUPPLIED);
 +  reset();
 +  return 0;
@@ -335,9 +415,23 @@ index b6b7e1f..152728b 100644
 +  presc= 0;
 +  pa_latch= pa_pins= 0;	// PORTA output pins are low out of reset; PA7 is an input (DDRA7=0)
 +  memset(pa_changes, 0, sizeof(pa_changes));
++  memset(pa_edge_cycle, 0, sizeof(pa_edge_cycle));
++  memset(pa_high_w, 0, sizeof(pa_high_w));
++  memset(pa_low_w, 0, sizeof(pa_low_w));
++  memset(latch_changes, 0, sizeof(latch_changes));
++  // The wheel rests in the gap just before tooth 1 (signal high); fixed so every run is reproducible.
++  crank_acc= 0;
++  crank_pos= 119;
++  crank_level= 1;
++  crank_edges= crank_rises= 0;
++  memset(tic, 0, sizeof(tic));
++  tic_valid= 0;
 +  spi_busy= false;
 +  spi_end= spi_n= 0;
 +  spsr_seen= dead_acc= 0;
++  memset(poison_addr, 0, sizeof(poison_addr));
++  memset(poison_tag, 0, sizeof(poison_tag));
++  pulling= false;
 +  sci_tdr= scsr_seen= 0;
 +  sci_tdr_full= sci_shifting= sci_preamble= false;
 +  sci_shift_end= sci_n= 0;
@@ -438,9 +532,45 @@ index b6b7e1f..152728b 100644
 +  return p[tmsk2 & 3];
 +}
 +
++bool
++cl_iaw8p::crank_on(void)
++{
++  return profile() == 2 && cfg_get(9 + IAW8P_ADC) <= IAW8P_CRANK_MAX;
++}
++
++// One edge of the simulated crank signal, seen by the pulse accumulator (PA7/PAI) and input
++// capture 3 (PA0/IC3) in the same E cycle (manual sections 7.4, 7.6, 10.2).
++void
++cl_iaw8p::crank_edge(bool rising)
++{
++  if (rising)
++    crank_rises++;
++  else
++    crank_edges++;
++  if (reg[0x26] & 0x80)
++    violation("input", 0x1000, -1, "PA7 is an output (DDRA7=1) while the simulated crank signal drives it");
++  else if (((reg[0x26] & 0x10) != 0) == rising)	// PEDGE: 0 falling, 1 rising
++    {
++      reg[0x25]|= 0x10;	// PAIF
++      if ((reg[0x26] & 0x60) == 0x40 && ++reg[0x27] == 0)
++	reg[0x25]|= 0x20;	// PAOVF on the PACNT $FF -> $00 transition (event-counting mode)
++      else if ((reg[0x26] & 0x60) == 0x60)
++	violation("input", 0x1026, reg[0x26], "PACTL gated time accumulation with a crank signal: not modelled");
++    }
++  u8_t edg3= reg[0x21] & 0x03;	// TCTL2 EDG3B:EDG3A: 01 rising, 10 falling, 11 any
++  if (edg3 == 3 || edg3 == (rising ? 1 : 2))
++    {
++      tic[2]= tcnt;
++      tic_valid|= 4;
++      reg[0x23]|= 0x01;	// IC3F
++    }
++}
++
 +int
 +cl_iaw8p::tick(int n)
 +{
++  // Commanded speed: 120 half-teeth per revolution, so 2*rpm half-teeth per second.
++  unsigned long rpm= crank_on() ? cfg_get(9 + IAW8P_ADC) : 0;
 +  while (n-- > 0)
 +    {
 +      cycles++;
@@ -456,6 +586,17 @@ index b6b7e1f..152728b 100644
 +		reg[0x23]|= 0x80 >> k;
 +		oc_action(k);
 +	      }
++	}
++      if (rpm && (crank_acc+= 2 * rpm) >= IAW8P_E_HZ)
++	{
++	  crank_acc-= IAW8P_E_HZ;
++	  crank_pos= (crank_pos + 1) % 120;
++	  u8_t lvl= (crank_pos < 116 && !(crank_pos & 1)) ? 0 : 1;	// teeth 59 and 60 missing
++	  if (lvl != crank_level)
++	    {
++	      crank_level= lvl;
++	      crank_edge(lvl);
++	    }
 +	}
 +      // RTI: E/2^13 times 1, 2, 4 or 8 (PACTL RTR1:0), counted from reset
 +      if ((cycles % ((unsigned long)8192 << (reg[0x26] & 3))) == 0)
@@ -517,7 +658,11 @@ index b6b7e1f..152728b 100644
 +    return;
 +  for (int b= 0; b < 8; b++)
 +    if (changed & (1 << b))
-+      pa_changes[b]++;
++      {
++	pa_changes[b]++;
++	(pa_pins & (1 << b) ? pa_high_w : pa_low_w)[b]= cycles - pa_edge_cycle[b];
++	pa_edge_cycle[b]= cycles;
++      }
 +  pa_pins= pins;
 +  event('O', 0x1000, pins);
 +}
@@ -603,7 +748,12 @@ index b6b7e1f..152728b 100644
 +      {
 +	u8_t inputs= 0x07 | ((reg[0x26] & 0x80) ? 0 : 0x80);
 +	if (profile() == 2 && cfg_get(5 + IAW8P_ADC) <= 255)
-+	  return (pa_pins & ~inputs) | (cfg_get(5 + IAW8P_ADC) & inputs);
++	  {
++	    u8_t in= cfg_get(5 + IAW8P_ADC);
++	    if (crank_on())
++	      in= (in & ~0x81) | (crank_level ? 0x81 : 0);	// PA7 and PA0 carry the crank signal
++	    return (pa_pins & ~inputs) | (in & inputs);
++	  }
 +	violation("port_read", a, -1, "PORTA input pin levels: external inputs are not modelled (H2 supplies them)");
 +	return 0;
 +      }
@@ -611,6 +761,10 @@ index b6b7e1f..152728b 100644
 +      return 0;
 +    case 0x0c: case 0x0d:	// OC1M, OC1D
 +      return reg[r];
++    case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:	// TIC1-TIC3
++      if (!(tic_valid & (1 << ((r - 0x10) / 2))))
++	violation("register_read", a, -1, "TICx read before any input capture: content undefined after reset");
++      return (r & 1) ? tic[(r - 0x10) / 2] & 0xff : tic[(r - 0x10) / 2] >> 8;
 +    case 0x0e: return tcnt >> 8;
 +    case 0x0f: return tcnt & 0xff;
 +    case 0x16: case 0x18: case 0x1a: case 0x1c: case 0x1e:
@@ -637,6 +791,12 @@ index b6b7e1f..152728b 100644
 +    case 0x2f:	// SCDR read: nothing was ever received, so the RDR content is unknown
 +      if (profile() != 2)
 +	break;
++      // The tracker holds one live unknown register. Never lose it to another unknown load.
++      if (dead_acc)
++        {
++          violation("register_read", a, -1, "A second unknown input would overwrite a live unknown-register tag");
++          return 0;
++        }
 +      if (cur_key == 0x96 || cur_key == 0xa6 || cur_key == 0xb6 || cur_key == 0x1a6)
 +	dead_acc= 'A';
 +      else if (cur_key == 0xd6 || cur_key == 0xe6 || cur_key == 0xf6 || cur_key == 0x1e6)
@@ -652,6 +812,12 @@ index b6b7e1f..152728b 100644
 +    case 0x2a:	// SPDR: received data comes from an unknown device; only a discarded load may read it
 +      reg[0x29]&= ~(spsr_seen & 0xc0);
 +      spsr_seen&= ~0xc0;
++      // The tracker holds one live unknown register. Never lose it to another unknown load.
++      if (dead_acc)
++        {
++          violation("register_read", a, -1, "A second unknown input would overwrite a live unknown-register tag");
++          return 0;
++        }
 +      if (cur_key == 0x96 || cur_key == 0xa6 || cur_key == 0xb6 || cur_key == 0x1a6)
 +	dead_acc= 'A';
 +      else if (cur_key == 0xd6 || cur_key == 0xe6 || cur_key == 0xf6 || cur_key == 0x1e6)
@@ -735,10 +901,10 @@ index b6b7e1f..152728b 100644
 +      reg[r]= v;
 +      set_pins((pa_pins & oc_pin_controlled()) | (pa_latch & ~oc_pin_controlled()));
 +      return;
-+    case 0x21:	// TCTL2: input-capture edge selection; edges never occur (no pin activity is modelled)
++    case 0x21:	// TCTL2: input-capture edge selection (H2: IC3 sees the crank signal; IC1/IC2 pins stay constant)
 +      reg[r]= v;
 +      return;
-+    case 0x27:	// PACNT: plain read/write counter while the pulse accumulator is disabled
++    case 0x27:	// PACNT: counter; H2 crank edges increment it in event-counting mode
 +      reg[r]= v;
 +      return;
 +    case 0x3b:	// PPROG: $00 keeps EEPROM programming off; H2 models the internal EEPROM (manual 4.5.4)
@@ -785,7 +951,9 @@ index b6b7e1f..152728b 100644
 +    case 0x26:	// PACTL (DDRA7 selects PA7 direction)
 +      // H2: PA7 is a constant supplied input, so an enabled pulse accumulator sees no edges.
 +      if ((v & 0x40) && profile() != 2)
-+	violation("register_write", a, v, "PACTL PAEN: pulse accumulator input not modelled (H2: no PA7 edges)");
++	violation("register_write", a, v, "PACTL PAEN: pulse accumulator input not modelled (H2 supplies PA7)");
++      if ((v & 0x60) == 0x60 && crank_on())
++	violation("register_write", a, v, "PACTL gated time accumulation with a crank signal: not modelled");
 +      reg[r]= v;
 +      set_pins((pa_pins & oc_pin_controlled()) | (pa_latch & ~oc_pin_controlled()));
 +      return;
@@ -912,7 +1080,10 @@ index b6b7e1f..152728b 100644
 +    }
 +  switch (rg)
 +    {
-+    case 0: case 4: case 6:
++    case 0: case 4:
++      poison_pulled(a);
++      return cell->get();
++    case 6:
 +      return cell->get();
 +    case 2:
 +      {
@@ -958,6 +1129,9 @@ index b6b7e1f..152728b 100644
 +  switch (rg)
 +    {
 +    case 0: case 4:
++      for (int i= 0; i < 4; i++)
++	if (poison_tag[i] && poison_addr[i] == a)
++	  poison_tag[i]= 0;	// overwritten: the unknown copy is gone
 +      return;
 +    case 2:
 +      reg_wr[a - 0x1000]++;
@@ -969,6 +1143,12 @@ index b6b7e1f..152728b 100644
 +      if (profile() >= 1 && (a == 0x1040 || a == 0x1050))
 +	{
 +	  // H1: write-only latches with unknown function; value recorded, no effect modelled
++	  int base= a == 0x1040 ? 0 : 8;
++	  u8_t old= a == 0x1040 ? latch1040 : latch1050;
++	  bool had= a == 0x1040 ? has_latch1040 : has_latch1050;
++	  for (int b= 0; had && b < 8; b++)
++	    if ((old ^ v) & (1 << b))
++	      latch_changes[base + b]++;
 +	  if (a == 0x1040) { latch1040= v; has_latch1040= true; }
 +	  else { latch1050= v; has_latch1050= true; }
 +	  event('L', a, v);
@@ -1100,27 +1280,152 @@ index b6b7e1f..152728b 100644
 +  return false;
 +}
 +
++// Does opcode key (page-qualified) read the X register? Conservative: unlisted pages count as reading.
++static bool
++iaw8p_reads_x(unsigned key)
++{
++  unsigned op= key & 0xff;
++  switch (key >> 8)
++    {
++    case 0:
++      if ((op >= 0x60 && op <= 0x6f) || (op >= 0xa0 && op <= 0xaf) || (op >= 0xe0 && op <= 0xef)
++	  || (op >= 0x1c && op <= 0x1f))
++	return true;	// indexed by X
++      switch (op)
++	{
++	case 0x02: case 0x03: case 0x08: case 0x09: case 0x35: case 0x3a: case 0x3c:	// IDIV FDIV INX DEX TXS ABX PSHX
++	case 0x8c: case 0x9c: case 0xbc: case 0x8f: case 0xdf: case 0xff:		// CPX XGDX STX
++	  return true;
++	}
++      return false;
++    case 1:	// page 18: Y forms, none involves X
++      return false;
++    case 2:	// page 1A: CPD, CPY, LDY, STY indexed by X
++      return op == 0xa3 || op == 0xac || op == 0xee || op == 0xef;
++    default:	// page CD: CPX ,Y and STX ,Y (LDX ,Y only writes X)
++      return op == 0xac || op == 0xef;
++    }
++}
++
++// One instruction while a register holds unknown data (dead_acc). Returns false if the
++// instruction may read it; otherwise updates dead_acc (cleared by an overwrite, moved by XGDX).
++static bool
++iaw8p_dead_step(unsigned key, u8_t &dead)
++{
++  static const unsigned ldd[]= { 0xcc, 0xdc, 0xec, 0xfc, 0x1ec };
++  switch (dead)
++    {
++    case 'A': case 'B':
++      {
++	if (iaw8p_overwrites_acc(key, dead))
++	  {
++	    dead= 0;
++	    return true;
++	  }
++	// Neither reads the dead accumulator nor the CCR: LDX/LDY #, bit operations, the other
++	// accumulator's loads and stores.
++	static const unsigned common[]= { 0xce, 0x1ce, 0x12, 0x13, 0x14, 0x15, 0x1c, 0x1d, 0x1e, 0x1f };
++	static const unsigned a_dead[]= { 0xc6, 0xd6, 0xe6, 0xf6, 0x1e6, 0xd7, 0xe7, 0xf7, 0x1e7 };
++	static const unsigned b_dead[]= { 0x86, 0x96, 0xa6, 0xb6, 0x1a6, 0x97, 0xa7, 0xb7, 0x1a7 };
++	const unsigned *other= dead == 'A' ? a_dead : b_dead;
++	for (unsigned i= 0; i < sizeof(common) / sizeof(common[0]); i++)
++	  if (common[i] == key)
++	    return true;
++	for (unsigned i= 0; i < sizeof(a_dead) / sizeof(a_dead[0]); i++)
++	  if (other[i] == key)
++	    return true;
++	return false;
++      }
++    case 'D':
++      for (unsigned i= 0; i < sizeof(ldd) / sizeof(ldd[0]); i++)
++	if (ldd[i] == key)
++	  {
++	    dead= 0;
++	    return true;
++	  }
++      if (key == 0x8f)
++	{
++	  dead= 'X';	// XGDX: the unknown value moves to X
++	  return true;
++	}
++      return false;
++    case 'X':
++      if (key == 0xce || key == 0xde || key == 0xfe || key == 0x38 || key == 0x30 || key == 0x3ee)
++	{
++	  dead= 0;	// LDX, PULX, TSX, LDX ,Y
++	  return true;
++	}
++      return !iaw8p_reads_x(key);
++    }
++  return false;
++}
++
++// Interrupt entry while a register holds unknown data: mark its stacked copy (and the CCR copy
++// after an unknown load) so that only the matching RTI pull may read it. False if out of slots.
++bool
++cl_iaw8p::poison_stack(t_addr sp)
++{
++  t_addr slots[3];
++  u8_t tags[3];
++  int n= 0;
++  switch (dead_acc)
++    {
++    case 'A': slots[n]= sp + 3; tags[n++]= 'A'; slots[n]= sp + 1; tags[n++]= '-'; break;
++    case 'B': slots[n]= sp + 2; tags[n++]= 'B'; slots[n]= sp + 1; tags[n++]= '-'; break;
++    case 'D': slots[n]= sp + 3; tags[n++]= 'D'; slots[n]= sp + 2; tags[n++]= 'D'; break;
++    case 'X': slots[n]= sp + 4; tags[n++]= 'X'; slots[n]= sp + 5; tags[n++]= 'X'; break;
++    }
++  if (nz_unknown && dead_acc != 'A' && dead_acc != 'B')
++    { slots[n]= sp + 1; tags[n++]= '-'; }
++  int free_n= 0;
++  for (int i= 0; i < 4; i++)
++    free_n+= poison_tag[i] == 0;
++  if (free_n < n)
++    return false;
++  for (int k= 0, i= 0; k < n; i++)
++    if (!poison_tag[i])
++      {
++	poison_addr[i]= slots[k] & 0xffff;
++	poison_tag[i]= tags[k++];
++      }
++  return true;
++}
++
++// A RAM access to a poisoned stack byte: the RTI pull restores the taint, anything else stops.
++void
++cl_iaw8p::poison_pulled(t_addr a)
++{
++  for (int i= 0; i < 4; i++)
++    if (poison_tag[i] && poison_addr[i] == a)
++      {
++	if (!pulling)
++	  violation("read", a, -1, "stacked copy of a register holding unknown data");
++	else if (poison_tag[i] == '-')
++	  nz_unknown= true;
++	else
++	  dead_acc= poison_tag[i];
++	poison_tag[i]= 0;
++      }
++}
++
 +bool
 +cl_iaw8p::check_before_inst(unsigned key)
 +{
 +  if (stop_pending)
 +    return true;	// never run past the first unsupported access
-+  if (dead_acc)
++  if (dead_acc && !iaw8p_dead_step(key, dead_acc))
 +    {
-+      u8_t acc= dead_acc;
-+      dead_acc= 0;
-+      if (!iaw8p_overwrites_acc(key, acc))
-+	{
-+	  violation("flags", uc->PC, -1, "the next instruction may use SPI data received from an unknown device");
-+	  return true;
-+	}
++      violation("flags", uc->PC, -1, dead_acc == 'X' || dead_acc == 'D'
++		? "the next instruction may use an indeterminate division remainder"
++		: "the next instruction may use SPI/SCI data received from an unknown device");
++      return true;
 +    }
 +  if (!nz_unknown)
 +    return false;
 +  nz_unknown= false;
 +  if (iaw8p_overwrites_nz(key))
 +    return false;
-+  violation("flags", uc->PC, -1, "N/Z depend on unknown PORTD input pins and the next instruction may read them");
++  violation("flags", uc->PC, -1, "N/Z depend on unknown input data and the next instruction may read them");
 +  return true;
 +}
 +
@@ -1205,14 +1510,18 @@ index b6b7e1f..152728b 100644
 +    IAW8P_VALUE(b->tcnt), IAW8P_ARRAY(b->toc, false), IAW8P_VALUE(b->presc),		\
 +    IAW8P_VALUE(b->pa_latch), IAW8P_VALUE(b->pa_pins), IAW8P_ARRAY(b->pa_changes, false),	\
 +    IAW8P_VALUE(b->spi_busy), IAW8P_VALUE(b->spi_end), IAW8P_VALUE(b->spi_n),		\
-+    IAW8P_VALUE(b->spsr_seen), IAW8P_ARRAY(b->spi_last, false), IAW8P_VALUE(b->dead_acc),	\
++    IAW8P_VALUE(b->spsr_seen), IAW8P_ARRAY(b->spi_last, false), IAW8P_VALUE(b->dead_acc), IAW8P_ARRAY(b->poison_addr, false), IAW8P_ARRAY(b->poison_tag, false),	\
 +    IAW8P_ARRAY(b->ee, false), IAW8P_VALUE(b->ee_init), IAW8P_VALUE(b->ee_latched),		\
 +    IAW8P_VALUE(b->sci_tdr), IAW8P_VALUE(b->scsr_seen), IAW8P_VALUE(b->sci_tdr_full),	\
 +    IAW8P_VALUE(b->sci_shifting), IAW8P_VALUE(b->sci_preamble), IAW8P_VALUE(b->sci_shift_end), \
 +    IAW8P_VALUE(b->sci_n), IAW8P_ARRAY(b->sci_last, false),				\
 +    IAW8P_VALUE(b->ee_addr), IAW8P_VALUE(b->ee_data), IAW8P_VALUE(b->ee_pgm_cycle),		\
 +    IAW8P_VALUE(b->ee_ops),								\
-+    IAW8P_VALUE(b->last_key), IAW8P_VALUE(b->nz_unknown), IAW8P_VALUE(b->portd_unknown) }
++    IAW8P_VALUE(b->last_key), IAW8P_VALUE(b->nz_unknown), IAW8P_VALUE(b->portd_unknown),	\
++    IAW8P_VALUE(b->crank_acc), IAW8P_VALUE(b->crank_pos), IAW8P_VALUE(b->crank_level),	\
++    IAW8P_VALUE(b->crank_edges), IAW8P_VALUE(b->crank_rises), IAW8P_ARRAY(b->tic, false),	\
++    IAW8P_VALUE(b->tic_valid), IAW8P_ARRAY(b->pa_edge_cycle, false), IAW8P_ARRAY(b->pa_high_w, false), \
++    IAW8P_ARRAY(b->pa_low_w, false), IAW8P_ARRAY(b->latch_changes, false) }
 +
 +static unsigned long
 +iaw8p_get(const struct iaw8p_field &f, int i)
@@ -1243,7 +1552,7 @@ index b6b7e1f..152728b 100644
 +  return true;
 +}
 +
-+#define IAW8P_STATE_VERSION 1
++#define IAW8P_STATE_VERSION 2
 +static const t_addr iaw8p_ram[2][2]= { { 0x0000, 0x0100 }, { 0x2000, 0x0800 } };
 +
 +bool
@@ -1417,7 +1726,25 @@ index b6b7e1f..152728b 100644
 +  if (cmdline->syntax_match(uc, STRING STRING))
 +    {
 +      chars op= p0->get_svalue(), path= p1->get_svalue();
-+      if (op == "save")
++      if (op == "sample")
++	{
++	  // Sample plus the bytes at a comma-separated list of hex addresses (read without side effects).
++	  class cl_m68hc11 *u= (class cl_m68hc11 *)uc;
++	  con->dd_printf("IAW8P-SAMPLE %lu %lu %u %u %u %u %u %u %u %lu %u |", inst(), cycles, (unsigned)u->PC, u->SP,
++			 u->acc.DAB.a8.Ar, u->acc.DAB.a8.Br, u->IX, u->IY, u->CC.cc16.cc8.ccl, crank_edges, crank_pos);
++	  const char *p= path.c_str();
++	  for (int k= 0; *p && k < 32; k++)
++	    {
++	      char *end;
++	      unsigned long addr= strtoul(p, &end, 16);
++	      if (end == p || addr > 0xffff)
++		break;
++	      con->dd_printf(" %u", (unsigned)uc->rom->get(addr));
++	      p= *end == ',' ? end + 1 : end;
++	    }
++	  con->dd_printf("\n");
++	}
++      else if (op == "save")
 +	con->dd_printf(save(path.c_str()) ? "IAW8P-SAVED\n" : "IAW8P-SAVE-ERROR\n");
 +      else if (op == "load")
 +	con->dd_printf(load(path.c_str(), con) ? "IAW8P-LOADED\n" : "IAW8P-LOAD-ERROR\n");
@@ -1445,7 +1772,7 @@ index b6b7e1f..152728b 100644
 +void
 +cl_iaw8p::set_help(class cl_console_base *con)
 +{
-+  con->dd_printf("set hardware iaw8p save|load FILE | sample | reg N VALUE\n");
++  con->dd_printf("set hardware iaw8p save|load FILE | sample [HEXADDR,...] | reg N VALUE\n");
 +}
 +
 +void
@@ -1477,6 +1804,11 @@ index b6b7e1f..152728b 100644
 +void
 +CL11::pull_regs(bool inst_part)
 +{
++  if (board)
++    {
++      board->dead_acc= 0;	// every register is replaced from the stack (a marked copy restores its taint)
++      board->pulling= true;
++    }
 +  u8_t l, h, cc= rom->read(++rSP);
 +  if (!(rCC & flagX))
 +    cc&= ~flagX;
@@ -1492,6 +1824,8 @@ index b6b7e1f..152728b 100644
 +  h= rom->read(++rSP);
 +  l= rom->read(++rSP);
 +  PC= h*256+l;
++  if (board)
++    board->pulling= false;
 +  if (!inst_part)
 +    tick(12);
 +  if (board)
@@ -1508,15 +1842,16 @@ index b6b7e1f..152728b 100644
 +	return resINV_ADDR;
 +      if (s >= 0)
 +	{
-+	  if (board->nz_unknown || board->dead_acc)
-+	    {
-+	      board->violation("interrupt", 0, -1, "interrupt would stack registers derived from unknown inputs");
-+	      return resINV_ADDR;
-+	    }
 +	  // Interrupt response between instructions: stack, set I, fetch the vector, 12 E cycles
-+	  // (cycles 3-14 of SWI, manual 5.5.1); then the first handler instruction runs.
++	  // (cycles 3-14 of SWI, manual 5.5.1); then the first handler instruction runs. A register
++	  // with unknown data stays unknown in the handler, and its stacked copy is marked.
 +	  t_addr vector= board->vector_of(s);
 +	  push_regs(true);
++	  if ((board->dead_acc || board->nz_unknown) && !board->poison_stack(rSP))
++	    {
++	      board->violation("interrupt", 0, -1, "nested interrupts would stack too many registers holding unknown data");
++	      return resINV_ADDR;
++	    }
 +	  rCC|= flagI;
 +	  PC= read_addr(rom, vector);
 +	  tick(12);
@@ -1545,10 +1880,10 @@ index b6b7e1f..152728b 100644
 +
  /* End of motorola.src/m68hc11.cc */
 diff --git i/src/core/motorola.src/m68hc11cl.h w/src/core/motorola.src/m68hc11cl.h
-index d0c1700..b917c15 100644
+index d0c1700..f4509fd 100644
 --- i/src/core/motorola.src/m68hc11cl.h
 +++ w/src/core/motorola.src/m68hc11cl.h
-@@ -63,6 +63,105 @@ public:
+@@ -63,6 +63,122 @@ public:
  };  
  
  
@@ -1562,6 +1897,8 @@ index d0c1700..b917c15 100644
 +#define IAW8P_EVENTS 256
 +#define IAW8P_SOURCES 15	// I-maskable interrupt sources in Figure 5-4 order
 +#define IAW8P_ADC 8
++#define IAW8P_E_HZ 2000000UL	// assumed E clock (8 MHz crystal / 4): converts commanded rpm to E cycles
++#define IAW8P_CRANK_MAX 9000	// iaw8p_crank_rpm above this: no crank signal modelled
 +
 +struct iaw8p_event {
 +  unsigned long inst, cycle;
@@ -1606,7 +1943,18 @@ index d0c1700..b917c15 100644
 +  bool sci_tdr_full, sci_shifting, sci_preamble;
 +  unsigned long sci_shift_end, sci_n;	// cycle the shifter frees; characters sent
 +  u8_t sci_last[32];			// last characters sent (ring, sci_n % 32)
-+  u8_t dead_acc;			// 'A'/'B': accumulator holds unknown data and must be overwritten next
++  // H2 crank stimulus: 60-2 wheel signal on PA7 (PAI) and PA0 (IC3); see iaw8p_crank_rpm.
++  unsigned long crank_acc;		// phase residual: 2*rpm added per E cycle, one half-tooth per IAW8P_E_HZ
++  u8_t crank_pos, crank_level;		// half-tooth position 0..119 (even: falling edge of tooth pos/2+1), pin level
++  unsigned long crank_edges, crank_rises;	// falling and rising edges generated
++  u16_t tic[3];				// TIC1-TIC3
++  u8_t tic_valid;			// bit k: TIC(k+1) captured at least once
++  unsigned long pa_edge_cycle[8], pa_high_w[8], pa_low_w[8];	// PORTA output pins: last change, last high/low width
++  unsigned long latch_changes[16];	// bit changes of $1040 (0-7) and $1050 (8-15)
++  u8_t dead_acc;			// 'A', 'B', 'D' or 'X': register holds unknown data, must be overwritten before any read
++  u16_t poison_addr[4];			// stack bytes holding unknown register data from an interrupt entry
++  u8_t poison_tag[4];			// register taint a pull restores ('A', 'B', 'D', 'X'), '-' for the CCR copy
++  bool pulling;				// RTI is pulling the stacked registers (never saved: only inside one instruction)
 +  unsigned int presc;
 +  unsigned last_key;	// previous instruction (CLI delays interrupt recognition by one instruction)
 +  bool nz_unknown;	// N/Z came from unknown input-pin bits (PORTD read-modify-write)
@@ -1618,7 +1966,7 @@ index d0c1700..b917c15 100644
 +public:
 +  cl_iaw8p(class cl_uc *auc);
 +  virtual int init(void);
-+  virtual unsigned int cfg_size(void) { return 4 + IAW8P_ADC + 5; }
++  virtual unsigned int cfg_size(void) { return 4 + IAW8P_ADC + 6; }
 +  virtual t_mem conf_op(cl_memory_cell *cell, t_addr addr, t_mem *val);
 +  virtual void reset(void);
 +  virtual t_mem read(class cl_memory_cell *cell);
@@ -1635,6 +1983,8 @@ index d0c1700..b917c15 100644
 +  void opcode(unsigned key, t_addr pc);
 +  bool check_after_inst(void);
 +  bool check_before_inst(unsigned key);
++  bool poison_stack(t_addr sp);
++  void poison_pulled(t_addr a);
 +  int pending_source(void);
 +  t_addr vector_of(int source);
 +  void interrupt_taken(int source, t_addr vector);
@@ -1645,6 +1995,8 @@ index d0c1700..b917c15 100644
 +  u8_t scsr(void);
 +  bool ee_ready(t_addr a);
 +  void set_pins(u8_t pins);
++  bool crank_on(void);
++  void crank_edge(bool rising);
 +  void oc_action(int k);
 +  u8_t oc_pin_controlled(void);
 +  bool save(const char *path);
@@ -1654,7 +2006,7 @@ index d0c1700..b917c15 100644
  /*
   * Base of M68HC11 processor
   */
-@@ -71,8 +170,16 @@ public:
+@@ -71,8 +187,16 @@ public:
  class cl_m68hc11: public cl_m68hcbase
  {
  public:

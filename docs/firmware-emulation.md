@@ -2,6 +2,15 @@
 
 ## Result
 
+**Update, 10 November 2026 (crank and throttle stimulus):** H2 now takes a commanded crank speed
+and a throttle stimulus that can change between chunks without a reset. A simulated 60-2 wheel
+signal drives the pulse accumulator (PA7) and input capture 3 (PA0), the pins and edges the
+firmware itself configures. The firmware decodes the teeth, verifies the gap and computes its own
+speed: `$D1` follows 250, 400, 900, 3000, 6500 and 9000 rpm on both files, and returns to 0
+(`$BB = $FFFF`) after the crank stops. A/D channel AN2 is the traced throttle candidate. No engine
+model exists; injector and ignition outputs remain unmapped. See
+[Crank and throttle stimulus](#crank-and-throttle-stimulus-simulation-profile-h2-10-november-2026).
+
 **Update, 10 November 2026 (later):** under the labelled simulation profile H2 (named
 board hypotheses, supplied raw inputs, engine stopped), both supported files reach the
 foreground loop `$D4A2` and keep running it with RTI and timer-overflow interrupts entered
@@ -391,14 +400,16 @@ their SHA-256 and, for a lookup, session edits restricted to `0x91AB..0x9282`.
 The bridge rechecks the profile hash, the lookup routine hash and all bounds.
 
 - **Run:** `{"action": "run", "profile": "strict"|"h1"|"h2", "budget": 0..2000000,
-  "inputs": null | {H2 inputs}, "checkpoint": null | {"state", "digest"}}`. Without a
+  "inputs": null | {H2 inputs}, "checkpoint": null | {"state", "digest"},
+  "checkpoint_inputs": null | {H2 inputs the checkpoint was sealed with}}` (protocol 4; see the
+  crank section for live input changes). Without a
   checkpoint the session starts at reset; with one, a fresh µCsim loads it. The request
   runs up to `budget` instructions in at most 64 steps, sampling PC, instruction count and
   E cycles after each, and returns a new checkpoint unless blocked. If a blocker occurs,
   the request is repeated from the same start and stops one instruction earlier. µCsim's
   clock delta must equal the board model's cycle delta, and the instruction counts must
   agree, otherwise the result is discarded. Commands are fed from a file, which µCsim does
-  not echo. Protocol version 3.
+  not echo.
 - **Lookup:** one call of `$B1C5` with a constructed descriptor at `$2100`, stopped
   before `RTS` at `$B218`. The simulator's `A` must equal the recovered arithmetic,
   otherwise the result is rejected.
@@ -461,8 +472,8 @@ fail-closed parsing.
 | PORTD inputs PD0–PD5 | supplied, default `$3F` (RxD idle high, SS high) | hypothesis |
 | A/D AN0–AN7 | supplied raw results, default `$80` | hypothesis; no channel meaning |
 | IRQ, XIRQ pins | inactive | hypothesis |
-| Input capture, pulse accumulator | no edges (PACTL PAEN allowed) | hypothesis (engine stopped) |
-| SPI, SCI received data | unknown: a load must be discarded by the next instruction, else stop | fail-closed |
+| Input capture, pulse accumulator | no edges (PACTL PAEN allowed); superseded: PA0/PA7 now carry the crank signal (see the crank section) | hypothesis |
+| SPI, SCI received data | unknown: tracked until overwritten, including across interrupts; using unknown data stops | fail-closed |
 | SCI receive line | idle since reset: RDRF, OR, IDLE stay 0 | hypothesis; manual: IDLE needs prior activity |
 | Internal EEPROM `$B600–$B7FF` | present (CONFIG EEON=1), power-up content = supplied fill byte, default `$FF` | firmware evidence: dump bytes there are all zero and `$DD62`/`$B425` program/erase there; content unknown |
 
@@ -504,9 +515,19 @@ Found by the new conformance cases (each now covered):
 11. `IDIV`/`FDIV` took 40 instead of 41 E cycles; `LDY ext` took 5 instead of 6.
 12. Reset left CCR at `$C0`; the HC11 resets with S, X and I set (`$D0`).
 
+Found on the crank path (see the crank section):
+
+13. `IDIV` and `FDIV` wrote the quotient into X and then computed the remainder with that new X. The
+    result was wrong whenever the remainder was not smaller than the quotient, and the simulator
+    crashed with SIGFPE when the quotient was 0. `FDIV` overflow (denominator ≤ numerator) and
+    division by zero now give quotient `$FFFF` with the remainder marked unknown (manual:
+    indeterminate); any later read of it stops the run.
+14. Page-18 cycle table: `CPY ext` (`18 BC`) counted 0 E cycles (its 7 was listed at `18 BD`) and
+    `LDY ,Y` 5 instead of 6. Page 1A: `STY ,X` was listed at `1A FE`.
+
 ### Conformance
 
-202 cases, hand-derived from the manual, run last in every simulator process: 172 opcodes,
+202 cases (now 235 for 200 opcodes; see the crank section), hand-derived from the manual, run last in every simulator process: 172 opcodes,
 both branch outcomes for every conditional branch on the path, and nine interrupt
 scenarios (entry stacks Y and sets I; handler clears TOF and RTI resumes; masked by I; CLI
 delay; taken after CLI + 1; a second CLI does not renew the delay; the same source re-entering after RTI while its flag stays
@@ -530,3 +551,191 @@ actions and the SCI transmitter.
 - Strict and H1 results are unchanged (20 and 68,202 instructions). H1 reads the dump's
   zero bytes at `$B600–$B7FF` as EPROM; its landmark at `$BC31` is the internal-EEPROM block
   check, not an EPROM checksum as first labelled.
+
+## Crank and throttle stimulus: simulation profile H2 (10 November 2026)
+
+### Result
+
+The firmware's own crank decoder runs on a simulated crank-wheel signal. The numbers below come
+from firmware RAM after chained 2,000,000-instruction requests from reset, identical for both
+supported files except where noted. Speed changes take effect at a request boundary without a
+reset.
+
+| Commanded | `$BB` (counts / 30 teeth) | Firmware `$D1` | `$AE` regime | Notes |
+|---|---|---|---|---|
+| 0 (key on) | `$FFFF` | 0 | bit 0 | baseline unchanged: 424 loop passes, RTI 961, TOF 30 |
+| 250 | 60000 | 250 | bit 0 | every tooth interrupts (`PACNT = $FF`) |
+| 400 | 37500 | 400 | bit 0 | |
+| 900 | 16666–16667 | 899–900 | bit 1 | |
+| 3000 | 5000 | 3000 | bits 1, 3/4 | |
+| 6500 | 2307–2308 | 6499–6501 | bit 2 | |
+| 9000 | 1666–1667 | 8998–9003 | bit 2 | |
+| 0 after running | `$FFFF` | 0 | bit 0 | gap flag `$AD` bit 4 cleared |
+
+`$D1` is not an echo of the input: the tests compute `$D1` from `$BB` with the firmware's own
+division and check `$BB` against the commanded tooth frequency separately. A 2,000,000-instruction
+request takes about 0.8 s at every speed.
+
+### Trace through the original code
+
+Static disassembly of `106XSI2.ORI` (recursive descent from the vectors with Capstone `cstool
+m6811`; bytes authoritative). The code at `$4000–$FFFF` is identical in both supported files; only
+the calibration `$800C–$9282` differs, and every calibration byte cited below is equal in both.
+
+- **Vectors** (`$FFD6–$FFFF`): PAOV `$9339`, IC1 `$B4AD`, IC2 `$75D7`, IC3 `$E2C6`, OC1 `$713D`,
+  OC2 `$750C`, OC3 `$5629`, OC4 `$7F5C`, OC5 `$5962`, TOF `$743C`, RTI `$78C5`; PAI, SPI, XIRQ and
+  SWI share the fatal handler `$B957`.
+- **Timer setup**: `$7888 BSET TCTL2,#$06` / `$788B BCLR TCTL2,#$09` and `$BDD3 BSET TCTL2,#$10`
+  give TCTL2 = `$16`: IC1 rising, IC2 rising, IC3 falling. `$788E` writes PACTL = `$40`: pulse
+  accumulator enabled, event counting, falling edge (PEDGE = 0), PA7 an input. TMSK2 = `$E1` in the
+  running scheduler: TOI, RTII and PAOVI, prescaler 4. Manual sections 10.2 (TCTL2), 11.2 (PACTL,
+  PACNT, PAOVF).
+- **Crank interrupt is PAOV, not an input capture.** `$9339 LDD $1014` reads TIC3 as the tooth time
+  and stores it at `$D6`; `$933E` clears PAOVF. At `$9494–$94A5` the handler preloads
+  `PACNT = $D8 − $D9` (current tooth minus next wanted tooth), so the next overflow comes exactly at
+  tooth `$D9`, and compares TIC3 again: a second capture meanwhile means one more counted edge.
+  This only works if the edges the pulse accumulator counts (PA7) are the edges IC3 captures (PA0).
+  **Wiring hypothesis:** the conditioned crank signal reaches both PA7 and PA0, active edge falling.
+  The board is not available to confirm this.
+- **Wheel: 60-2.** The decoder visits teeth 1 → 20 → 50 → 56 → 58 and back to 1 (`$9358–$9418`).
+  At tooth 58 it stores the 56→58 time (two tooth periods) in `$EA`; at tooth 1 (`$9375–$9384`) it
+  requires the 58→1 time to be at least `$EA`, which a 60-2 gap (three tooth periods) satisfies
+  and an ordinary tooth does not; success sets `$AD` bit 4, failure calls `$9C6E`, which counts
+  `$2093` and re-labels the edge. Below the regime threshold (`$AE` bit 0) every tooth interrupts
+  (`$94BA PACNT = $FF`) and the search at `$9753` runs.
+- **Period and speed.** At teeth 20 and 50 (`$95E1–$961A`), `$BB = $D6 − $B9`, the TCNT time of 30
+  teeth (180°); one or more timer overflows in between give `$BB = $FFFF`. `$429B–$42A9` computes
+  `IDIV 58594/$BB` and `FDIV remainder/$BB` and stores `$D1:$D2` = low quotient byte : high
+  fraction byte = ⌊256 × 58594 / $BB⌋ ≈ 15,000,064 / `$BB`. `$CE` and `$D0` hold `$D1:$D2`/8 and /32
+  saturated to 255. **This is the firmware's speed formula.** Reading `$D1` as rpm needs a 2 µs
+  count: E = 2 MHz with prescaler 4, which is the profile's assumption (TCNT counts per 180° =
+  E/4 × 30/rpm = 15,000,000/rpm). It is consistent with the RPM axis words of the 24-row table
+  (`round(15000000/word)`) and with `BAUD = $33`, but not measured.
+- **Regimes** (`$9662–$96A9`, calibration words, both files): `$AE` bit 0 → bit 1 when `$BB` <
+  `$9314` (18750, 800 rpm at 2 µs); bit 1 → bit 0 when `$BB` > `$9316` (30000, 500 rpm); bit 1 ↔
+  bit 2 around `$9318`/`$931A` (3000/2800 rpm). `$1050` bit 3 follows `$BB` < `$931C`. These are
+  firmware states; their names are not known.
+- **Timeout:** with no tooth, the TOF handler counts overflows in `$B8`; the next tooth interrupt
+  or the stall path resets `$BB = $FFFF` (`$782D`), `$AE` bit 0 is set again and `$AD` bit 4 clears.
+- **Crank enable gate.** `$4DC4`, `$6F0B` and `$B367` enable PAOVI only when RAM `$88` ≠ `$F0`.
+  `$4C1D–$4C3E` sets `$88 = $0F` when the word at `$2634` equals `$79BC`, else calls `$4C41`. This
+  looks like the immobilizer/code state. The model does not touch it: under the H2 inputs the
+  firmware itself computes `$88 = $0F` and enables PAOVI. No byte is patched and no value forced.
+- **IC1 and IC2 are not the crank.** IC1 (`$B4AD`, PA2) counts events into `$25AE`; its signal is
+  unknown. IC2 (`$75D7`, PA1) is armed only by the OC2 handler and measures the time from an OC2
+  event (`$DC`) into `$E4`/`$E6`, alternating with `$A2` bit 7. It feeds `$7680`/`$76F7`, which
+  compute `$E0`/`$E2`. This is plausibly coil-current feedback for dwell control. It is not
+  stimulated: PA1 and PA2 stay at their supplied levels. IC3's own handler `$E2C6` runs only in
+  test mode `$21BB = 6`, otherwise it jumps to `$B957`; the firmware never enables IC3I.
+
+### A/D channels
+
+The firmware starts sequences with ADCTL `$14` (MULT, AN4–AN7) and `$10` (MULT, AN0–AN3)
+(`$B82F`, `$B8C3`, `$40DE`, `$4124`) and copies the results:
+
+| Channel | Copy | Evidence of use | Status |
+|---|---|---|---|
+| AN1 | `$2008` | compared with `$928B/$928C` at `$5C48` | unknown |
+| AN2 | `$2003` | range check `$9284–$9285` (3–252), step limit `$928A` (5) and fault flags `$1B` (`$5FAF`); validated value `$C6`/`$200F`; `$2013 = $C6 − $0E`; closed flag `$AA` bit 6 near `$0E`, open flag bit 7 near `$0D` (`$7A1E`); learned endpoints `$0E`/`$0D` start from `$88FE`/`$88FD` (64/208) and adapt (`$4227`/`$425E`); `$C6 − $200F` change used at `$7B5E` | **throttle candidate** |
+| AN3 | `$200A` | filtered into `$200B` (`$416A`); copied to `$200E` as the stored baro value at low speed (`$42EB`), with `$2010 = 1013` set at startup | manifold-pressure candidate (not stimulated by the throttle control) |
+| AN4 | `$2004` | linearised through `$B31E` into `$2005` | unknown (temperature-like) |
+| AN6 | `$2009` | `$4149` | unknown |
+| AN7 | `$2006` | linearised through `$B31E` into `$2007` | unknown (temperature-like) |
+
+AN0 is read only in test mode (`$E2EC`); AN5 is converted but not stored. The AN2 conclusion comes
+from the firmware's own processing, not from XDF names. It is still not a hardware fact. The GUI
+therefore labels AN2 a candidate and lets the user pick another channel and other endpoints.
+
+In the runs, AN2 = `$40` sets `$AA` bit 6; `$D0` sets bit 7; `$F0` raises the learned open endpoint
+`$0D` from 208 to 240. Out-of-range values (`$02`, `$FE`, `$FF`) latch `$1B` faults. The firmware
+then substitutes the closed endpoint, and above `$9289` (1000 rpm) the default `$9286` (128).
+Later raw changes no longer move `$C6` until Reset. A step of more than 5 counts between samples
+sets `$1B` bit 1. This is the firmware's own fault handling, shown as such.
+
+### Board model additions (reference manual sections)
+
+- **Crank signal** (`iaw8p_crank_rpm`, 0–9000; above 9000 the signal is not modelled and PA0/PA7
+  reads behave as before). Each E cycle adds 2 × rpm to a residual. Each time it reaches
+  2,000,000 (the assumed E clock), the wheel advances half a tooth. One revolution is 120 half
+  teeth. Even positions below 116 are falling edges of teeth 1–58, odd positions are rising edges,
+  and positions 116–119 (teeth 59 and 60) stay high. The wheel rests in the gap just before tooth 1
+  at reset, so every run is reproducible. Commanded speed changes keep the position and residual,
+  so the phase is continuous. Edges happen at exact E cycles after the timer update of that cycle.
+  The checkpoint saves position, residual, level and edge counts.
+- **Pulse accumulator** (11.2): an active PA7 edge (PEDGE) sets PAIF; with PAEN in event-counting
+  mode it increments PACNT, and `$FF → $00` sets PAOVF. Gated-time mode with a crank signal stops
+  the run, and so does PA7 as an output (DDRA7) while the crank drives it.
+- **Input capture** (10.2): a PA0 edge selected by EDG3B:EDG3A latches TCNT into TIC3 and sets
+  IC3F. TIC1–TIC3 reads before any capture stop (content undefined after reset). The capture is
+  the TCNT value of the edge's E cycle: the manual's synchroniser delay and the one-cycle capture
+  inhibit after a high-byte read are not modelled. This gives ±1 count of uncertainty at prescaler 1
+  and less than one count at prescaler 4.
+- **PORTA** reads PA0 and PA7 from the crank signal; PA1 and PA2 still come from `porta_in`, whose
+  bits 0 and 7 must be 0.
+- **Interrupts and unknown data.** Unknown SPI/SCI receive data (`$A1A6 LDAA SPDR` then
+  `LDAA #$55`) and an indeterminate division remainder may now be interrupted. The register stays
+  marked unknown inside the handler, and its stacked copy, plus the CCR copy after an unknown load,
+  is marked. Only the matching RTI pull may read it, and the pull restores the mark. Any other
+  read, or any instruction outside a small whitelist that could read the unknown value, still
+  stops the run.
+- **Outputs**: per PORTA pin, the last completed high and low phase in E cycles; per `$1040`/`$1050`
+  bit, the number of changes. Their actuator mapping is unknown.
+
+### Live input changes (protocol 4)
+
+A checkpoint stays sealed with the inputs it was produced under. A Run request carries the new
+`inputs` and, with a checkpoint, `checkpoint_inputs`: the inputs it was sealed with. The bridge
+verifies the seal against `checkpoint_inputs` and refuses a mismatch. It then applies the new
+inputs from the checkpoint's instruction boundary, reports `inputs_changed` and seals the new
+checkpoint with the new inputs. Only `eeprom_fill` cannot change, because it applies at power-up;
+the GUI resets the session for it. Analog changes reach the firmware through A/D conversions that
+complete after the boundary. Result registers already latched are never patched. RAM is not
+written, PC is not moved and no firmware byte changes. Tests cover the instruction counter
+continuing across speed and throttle steps, refused forged checkpoints, and exact continuity: a
+split inside a half tooth gives byte-identical checkpoints to one run.
+
+The GUI keeps a running session when inputs change. A result that was in flight belongs to the
+inputs it ran with; the next chunk uses the new inputs. While paused, the card shows the
+instruction where pending changes will apply. Target, working-copy or profile changes still
+discard results and cancel the in-flight process group.
+
+### Conformance
+
+235 cases, 200 opcodes: 26 new opcodes on the crank and throttle paths (`FDIV`, `TSX`, `LSRA`,
+`RORA`, `RORB`, `COM`/`LSR`/`ROR`/`ASL`/`ROL` extended, `EORA #`, `SUBA` direct, `SUBD` direct,
+`SBCA` extended, `ADCB #`, `ADDB` immediate/indexed/extended, `BVC`, `BVS`, `DEY`, `TSY`, `TYS`, `CPY`
+immediate/extended, `LDY` direct, `CPD` direct/indexed), plus cases that catch defects 13 and 14.
+Python tests cover pulse-accumulator counting and overflow, edge polarity, the TIC3 capture time
+(E cycles 500 and 334 for a 6000 rpm wheel from rest), undefined TIC3, gated mode, and use of an
+unknown remainder.
+
+### Limits
+
+- **Not an engine.** Speed is commanded; throttle never changes it; there is no load, airflow,
+  torque or combustion model. Instant speed steps are physically impossible. The firmware may react
+  to them with sync errors: an 800→2500 rpm step counted 8 in `$2093`.
+- Unverified: E clock (2 MHz), crank wiring to PA7 and PA0, edge polarity at the sensor, the AN2
+  throttle assignment and its endpoints, the CPU suffix and the board decode. A real sensor may
+  have a different duty cycle; the model uses 50 %, and only falling edges matter to this firmware.
+- `$2093` and `$2096` are never initialised by the firmware: they start at `$AA` from the RAM test,
+  so count changes, not values.
+- Below about 229 rpm `$BB` overflows (one TOF between teeth 20 and 50) and the firmware reports no
+  speed. The model accepts 1–9000 rpm; the GUI allows 30–9000.
+- IC1 and IC2 inputs, the cam/phase input (none found), knock, lambda and all other sensors are
+  constant raw values. No output is mapped to an injector or coil. OC2/PA6 with `$1050` bit 5
+  alternating per crank half-turn and OC3/PA5 being forced low at stop (`$B405`) are suggestive,
+  but not proven.
+- Opcodes outside the 200 audited ones still stop the run. Other input combinations may reach
+  them.
+
+### Review safeguards
+
+The throttle percentage is derived from the selected raw ADC value and endpoints, including
+raw edits and channel changes. Values outside those endpoints, or equal endpoints, display
+an unavailable percentage. Completed readings show the raw input actually applied to that
+run; the history plot always compares AN2 with the firmware's AN2-derived `$C6`.
+
+The unknown-data tracker stops if a second independent unknown serial input would replace a
+still-live unknown register. Interrupt returns preserve unknown N/Z flags even if the handler
+overwrites the stacked accumulator. Regression snippets cover both cases; these stops preserve
+the boundary between supplied inputs and hardware data the model cannot know.

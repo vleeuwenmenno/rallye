@@ -20,7 +20,7 @@ const OUTPUT_LIMIT: u64 = 4 << 20;
 pub const MAX_RUN: u32 = 2_000_000;
 /// Assumed E clock (8 MHz crystal / 4); only labels virtual time.
 pub const E_CLOCK_HZ: u64 = 2_000_000;
-const PROTOCOL: u64 = 3;
+const PROTOCOL: u64 = 4;
 /// The only bytes a session edit may change for a lookup (24 rows × stride 9 at 0x91AB).
 pub const TABLE: RangeInclusive<usize> = 0x91AB..=0x9282;
 /// Reviewed firmware profiles; the bridge re-checks the same list (SUPPORTED in firmware_probe.py).
@@ -71,13 +71,17 @@ impl Board {
     }
 }
 
+/// Highest commanded crank speed (CRANK_MAX in the board model).
+pub const CRANK_MAX: u16 = 9000;
+
 /// H2 simulated inputs in raw units. Their physical meaning is unknown; the defaults are explicit
-/// hypotheses (DEFAULT_INPUTS in firmware_probe.py), not measurements.
+/// hypotheses (DEFAULT_INPUTS in firmware_probe.py), not measurements. Every input except
+/// `eeprom_fill` may change at a chunk boundary without resetting the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Inputs {
     pub in1060: u8,
     pub in1080: u8,
-    /// PORTA input pins PA0-PA2 and PA7 (output bits are ignored).
+    /// PORTA input pins PA1 and PA2 (PA0 and PA7 carry the crank signal; other bits must be 0).
     pub porta_in: u8,
     /// PORTD input pins PD0-PD5 (0..=63).
     pub portd_in: u8,
@@ -85,18 +89,24 @@ pub struct Inputs {
     pub eeprom_fill: u8,
     /// Raw A/D results of channels AN0..AN7.
     pub adc: [u8; 8],
+    /// Commanded speed of the simulated 60-2 crank wheel (0 = stopped), rpm at the assumed 2 MHz E clock.
+    pub crank_rpm: u16,
 }
 
 impl Default for Inputs {
     fn default() -> Self {
-        Self { in1060: 0x00, in1080: 0x00, porta_in: 0x00, portd_in: 0x3F, eeprom_fill: 0xFF, adc: [0x80; 8] }
+        Self { in1060: 0x00, in1080: 0x00, porta_in: 0x00, portd_in: 0x3F, eeprom_fill: 0xFF, adc: [0x80; 8], crank_rpm: 0 }
     }
 }
 
 impl Inputs {
     fn json(&self) -> Value {
         json!({"in1060": self.in1060, "in1080": self.in1080, "porta_in": self.porta_in, "portd_in": self.portd_in,
-            "eeprom_fill": self.eeprom_fill, "adc": self.adc})
+            "eeprom_fill": self.eeprom_fill, "adc": self.adc, "crank_rpm": self.crank_rpm})
+    }
+
+    fn valid(&self) -> bool {
+        self.portd_in <= 63 && self.porta_in & 0x81 == 0 && self.crank_rpm <= CRANK_MAX
     }
 }
 
@@ -107,13 +117,15 @@ pub struct Checkpoint {
     pub digest: String,
     /// Instructions executed when it was taken.
     pub inst: u64,
+    /// The inputs it is sealed with; a request with other inputs applies them from this instruction on.
+    pub inputs: Inputs,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunReq {
     pub board: Board,
     pub budget: u32,
-    /// Sent only for H2.
+    /// Sent only for H2; may differ from the checkpoint's inputs (applied at its instruction boundary).
     pub inputs: Inputs,
     /// None: start from reset.
     pub checkpoint: Option<Checkpoint>,
@@ -207,10 +219,37 @@ pub struct Outputs {
     pub porta_latch: u8,
     pub porta_pins: u8,
     pub porta_changes: [u64; 8],
+    /// Last completed high and low phase of each PORTA output pin, in E cycles (0: none yet).
+    pub porta_high: [u64; 8],
+    pub porta_low: [u64; 8],
+    /// Bit changes of the $1040 (0..8) and $1050 (8..16) latches.
+    pub latch_changes: [u64; 16],
     pub spi_bytes: u64,
     pub spi_last: Vec<u8>,
     pub sci_bytes: u64,
     pub sci_last: Vec<u8>,
+}
+
+/// The simulated crank signal after the last instruction (stimulus side, not a firmware reading).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Crank {
+    pub rpm: u16,
+    pub edges: u64,
+    /// Half-tooth position 0..119; `tooth` 1..58 when on a tooth, None in the two-tooth gap.
+    pub position: u8,
+    pub tooth: Option<u8>,
+    pub level: u8,
+    pub pacnt: u8,
+    pub tic3: Option<u16>,
+}
+
+/// One sample: instruction, E cycle, crank falling edges so far, and the probed firmware RAM bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sample {
+    pub inst: u64,
+    pub cycles: u64,
+    pub edges: u64,
+    pub probe: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -252,8 +291,32 @@ pub struct Run {
     pub eeprom: Option<(bool, u64, Vec<u8>)>,
     pub ram_internal: Vec<u8>,
     pub ram_external: Vec<u8>,
+    /// The inputs this request ran with, and which of them changed at its start.
+    pub inputs: Inputs,
+    pub inputs_changed: Vec<String>,
+    /// Probed RAM addresses (address, name) and one sample per entry of `samples`.
+    pub probes: Vec<(u16, String)>,
+    pub trace: Vec<Sample>,
+    /// H2 only.
+    pub crank: Option<Crank>,
     /// None after a blocker: the session cannot continue.
     pub checkpoint: Option<Checkpoint>,
+}
+
+impl Run {
+    /// A byte of the RAM image after the last instruction (internal $0000-$00FF, external $2000-$27FF).
+    pub fn ram(&self, addr: u16) -> Option<u8> {
+        match addr {
+            0..=0xFF => self.ram_internal.get(addr as usize).copied(),
+            0x2000..=0x27FF => self.ram_external.get(addr as usize - 0x2000).copied(),
+            _ => None,
+        }
+    }
+
+    /// The index of a probed address in each trace sample.
+    pub fn probe(&self, addr: u16) -> Option<usize> {
+        self.probes.iter().position(|p| p.0 == addr)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -310,12 +373,14 @@ pub fn request_json(req: &Request, sim: &Path, original: &[u8], sha: &str, edits
     }
     let mut v = json!({"version": PROTOCOL, "simulator": sim.to_string_lossy(), "sha256": sha, "image": hex(original)});
     match req {
-        Request::Run(r) if r.budget <= MAX_RUN && r.inputs.portd_in <= 63 => {
+        Request::Run(r) if r.budget <= MAX_RUN && r.inputs.valid() && r.checkpoint.as_ref().is_none_or(|c| c.inputs.valid()) => {
+            let h2 = r.board == Board::H2;
             v["action"] = "run".into();
             v["profile"] = r.board.key().into();
             v["budget"] = r.budget.into();
-            v["inputs"] = if r.board == Board::H2 { r.inputs.json() } else { Value::Null };
+            v["inputs"] = if h2 { r.inputs.json() } else { Value::Null };
             v["checkpoint"] = r.checkpoint.as_ref().map_or(Value::Null, |c| json!({"state": c.state, "digest": c.digest}));
+            v["checkpoint_inputs"] = r.checkpoint.as_ref().filter(|_| h2).map_or(Value::Null, |c| c.inputs.json());
         }
         &Request::Lookup(c) if c.row <= Coord::ROW_MAX && c.col <= Coord::COL_MAX && edits.iter().all(|(i, _)| TABLE.contains(i)) => {
             v["action"] = "lookup".into();
@@ -466,7 +531,7 @@ pub fn parse(req: &Request, sha: &str, edits: usize, v: &Value) -> Result<Outcom
             {
                 return Err(bad("run echo"));
             }
-            parse_run(r.board, r.budget, start, v).map(|r| Outcome::Run(Box::new(r)))
+            parse_run(r.board, r.budget, start, r.inputs, v).map(|r| Outcome::Run(Box::new(r)))
         }
         &Request::Lookup(c) => {
             let echo = [("row", c.row), ("column", c.col), ("row_fraction", c.row_frac), ("column_fraction", c.col_frac)];
@@ -531,7 +596,7 @@ fn byte_list(v: &Value, k: &str) -> Result<Vec<u8>, String> {
 }
 
 /// A run must be internally consistent: counters, samples and landmarks within what was executed.
-fn parse_run(board: Board, budget: u32, start: u64, v: &Value) -> Result<Run, String> {
+fn parse_run(board: Board, budget: u32, start: u64, inputs: Inputs, v: &Value) -> Result<Run, String> {
     let executed = num(v, "executed", start + budget as u64)?;
     if executed < start {
         return Err(bad("executed"));
@@ -656,6 +721,9 @@ fn parse_run(board: Board, budget: u32, start: u64, v: &Value) -> Result<Run, St
         porta_latch: num(o, "porta_latch", 0xFF)? as u8,
         porta_pins: num(o, "porta_pins", 0xFF)? as u8,
         porta_changes: changes,
+        porta_high: nums::<8>(field(o, "porta_high_cycles")?, "outputs")?,
+        porta_low: nums::<8>(field(o, "porta_low_cycles")?, "outputs")?,
+        latch_changes: nums::<16>(field(o, "latch_changes")?, "outputs")?,
         spi_bytes: num(o, "spi_bytes", u64::MAX)?,
         spi_last: byte_list(o, "spi_last")?,
         sci_bytes: num(o, "sci_bytes", u64::MAX)?,
@@ -673,8 +741,49 @@ fn parse_run(board: Board, budget: u32, start: u64, v: &Value) -> Result<Run, St
     let checkpoint = match field(v, "checkpoint")? {
         Value::Null => None,
         _ if blocker.is_some() => return Err(bad("checkpoint")),
-        c => Some(Checkpoint { state: text(c, "state")?, digest: text(c, "digest")?, inst: executed }),
+        c => Some(Checkpoint { state: text(c, "state")?, digest: text(c, "digest")?, inst: executed, inputs }),
     };
+    let probes = list(v, "probes")?
+        .iter()
+        .map(|p| match p.as_array().map(Vec::as_slice) {
+            Some([a, n]) => Ok((word(a.as_u64().ok_or_else(|| bad("probes"))?, "probes")?, n.as_str().ok_or_else(|| bad("probes"))?.to_string())),
+            _ => Err(bad("probes")),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let trace = list(v, "trace")?
+        .iter()
+        .map(|t| {
+            let a = t.as_array().filter(|a| a.len() == 3 + probes.len()).ok_or_else(|| bad("trace"))?;
+            let n = |k: usize| a[k].as_u64().ok_or_else(|| bad("trace"));
+            let probe = a[3..].iter().map(|b| b.as_u64().and_then(|b| u8::try_from(b).ok()).ok_or_else(|| bad("trace"))).collect::<Result<_, _>>()?;
+            Ok(Sample { inst: n(0)?, cycles: n(1)?, edges: n(2)?, probe })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    // The trace is the same sample sequence as `samples`, with edge counts that never go back.
+    if trace.len() != samples.len() || trace.iter().zip(&samples).any(|(t, s)| (t.inst, t.cycles) != (s.0, s.1)) || trace.windows(2).any(|w| w[0].edges > w[1].edges) {
+        return Err(bad("trace"));
+    }
+    let crank = match field(v, "crank")? {
+        Value::Null if board != Board::H2 => None,
+        c if board == Board::H2 => {
+            let position = num(c, "position", 119)? as u8;
+            let tooth = match field(c, "tooth")? {
+                Value::Null if position >= 116 => None,
+                t => Some(t.as_u64().filter(|&t| position < 116 && t == position as u64 / 2 + 1).ok_or_else(|| bad("crank"))? as u8),
+            };
+            let tic3 = match field(c, "tic3")? {
+                Value::Null => None,
+                _ => Some(num(c, "tic3", 0xFFFF)? as u16),
+            };
+            let rpm = num(c, "rpm", CRANK_MAX as u64)? as u16;
+            if rpm != inputs.crank_rpm || trace.last().map(|t| t.edges) != Some(num(c, "edges", u64::MAX)?) {
+                return Err(bad("crank"));
+            }
+            Some(Crank { rpm, edges: num(c, "edges", u64::MAX)?, position, tooth, level: num(c, "level", 1)? as u8, pacnt: num(c, "pacnt", 0xFF)? as u8, tic3 })
+        }
+        _ => return Err(bad("crank")),
+    };
+    let inputs_changed = list(v, "inputs_changed")?.iter().map(|k| k.as_str().map(str::to_string).ok_or_else(|| bad("inputs_changed"))).collect::<Result<Vec<_>, _>>()?;
     if blocker.is_none() && checkpoint.is_none() {
         return Err(bad("checkpoint"));
     }
@@ -710,6 +819,11 @@ fn parse_run(board: Board, budget: u32, start: u64, v: &Value) -> Result<Run, St
         eeprom,
         ram_internal: bytes_of(ram, "internal", 256)?,
         ram_external: bytes_of(ram, "external", 2048)?,
+        inputs,
+        inputs_changed,
+        probes,
+        trace,
+        crank,
         checkpoint,
     })
 }
@@ -736,7 +850,10 @@ mod tests {
             ("interrupts", json!([])),
             ("rti", json!(0)),
             ("loop", json!({"pc": 0xD4A2, "count": 0, "sp_min": null, "sp_max": null, "gap_max": 0})),
-            ("outputs", json!({"porta_latch": 0, "porta_pins": 0, "porta_changes": [0, 0, 0, 0, 0, 0, 0, 0], "spi_bytes": 0, "spi_last": [], "sci_bytes": 0, "sci_last": []})),
+            ("outputs", json!({"porta_latch": 0, "porta_pins": 0, "porta_changes": ([0u64; 8]), "porta_high_cycles": ([0u64; 8]), "porta_low_cycles": ([0u64; 8]), "latch_changes": ([0u64; 16]), "spi_bytes": 0, "spi_last": [], "sci_bytes": 0, "sci_last": []})),
+            ("probes", json!([[0xBB, "period hi"]])),
+            ("crank", Value::Null),
+            ("inputs_changed", json!([])),
             ("eeprom", Value::Null),
             ("ram", json!({"internal": "00".repeat(256), "external": "00".repeat(2048)})),
             ("cop_gap_max", json!(0)),
@@ -747,7 +864,7 @@ mod tests {
     }
 
     fn run_json() -> Value {
-        let mut v = json!({"version": 3, "ok": true, "action": "run", "sha256": XSI2, "profile": "strict", "board": "b", "core": "c",
+        let mut v = json!({"version": 4, "ok": true, "action": "run", "sha256": XSI2, "profile": "strict", "board": "b", "core": "c",
             "budget": 100, "start": 0, "executed": 20, "cycles": 71, "e_clock_hz": 2_000_000, "registers": regs_json(0xB834, 6),
             "samples": [[0, 0, 0xB800], [10, 40, 0xB81B], [20, 71, 0xB834]],
             "blocker": {"pc": 0xB834, "bytes": "B7 10 40", "text": "STA A,$1040", "kind": "write", "address": 0x1040, "value": 6, "reason": "r"},
@@ -757,6 +874,7 @@ mod tests {
             "pages": [[0xB8, 20]], "cop_services": 0, "cop_cycle": 0, "tcnt": 17, "rom_same_writes": 0,
             "opcodes": {"executed": 7, "audited": 82}, "checkpoint": null});
         common(&mut v);
+        v["trace"] = json!([[0, 0, 0, 0xFF], [10, 40, 0, 0xFF], [20, 71, 0, 0xFF]]);
         v
     }
 
@@ -771,6 +889,9 @@ mod tests {
             ("executed", json!(2000)),
             ("cycles", json!(8000)),
             ("samples", json!([[1000, 4000, 0xD4A2], [2000, 8000, 0xD4A5]])),
+            ("trace", json!([[1000, 4000, 7, 0x41], [2000, 8000, 9, 0x40]])),
+            ("crank", json!({"rpm": 900, "edges": 9, "rises": 9, "position": 40, "tooth": 21, "level": 0, "residual": 5, "pacnt": 0xF0, "tic3": 0x1234})),
+            ("inputs_changed", json!(["crank_rpm"])),
             ("registers", regs_json(0xD4A5, 0)),
             ("blocker", Value::Null),
             ("pages", json!([[0xD4, 2000]])),
@@ -778,7 +899,7 @@ mod tests {
             ("rti", json!(4)),
             ("loop", json!({"pc": 0xD4A2, "count": 5, "sp_min": 0x27FF, "sp_max": 0x27FF, "gap_max": 900})),
             ("eeprom", json!({"init": true, "ops": 2, "bytes": "ff".repeat(512)})),
-            ("inputs", Inputs::default().json()),
+            ("inputs", CRANKING.json()),
             ("events", json!([[0, 1500, 6000, 0x743C, "I", 0xFFDE, 10], [1, 1600, 6100, 0x7480, "T", 0xD4A5, 0]])),
             ("checkpoint", json!({"state": "eJw=", "digest": "d"})),
         ] {
@@ -787,8 +908,10 @@ mod tests {
         v
     }
 
+    const CRANKING: Inputs = Inputs { in1060: 0, in1080: 0, porta_in: 0, portd_in: 0x3F, eeprom_fill: 0xFF, adc: [0x80; 8], crank_rpm: 900 };
+
     fn cp(inst: u64) -> Checkpoint {
-        Checkpoint { state: "s".into(), digest: "d".into(), inst }
+        Checkpoint { state: "s".into(), digest: "d".into(), inst, inputs: Inputs::default() }
     }
 
     const RUN: fn() -> Request = || run_req(Board::Strict, 100, None);
@@ -828,21 +951,24 @@ mod tests {
         let mut v = run_json();
         v["blocker"]["pc"] = json!(0xB837); // blocked instruction must be the next PC
         assert!(parse(&RUN(), XSI2, 0, &v).is_err());
-        v = json!({"version": 3, "ok": false, "error": "Unsupported dump"});
+        v = json!({"version": 4, "ok": false, "error": "Unsupported dump"});
         assert_eq!(parse(&RUN(), XSI2, 0, &v), Err("backend: Unsupported dump".into()));
     }
 
     #[test]
     fn continued_h2_response() {
-        let req = run_req(Board::H2, 1000, Some(cp(1000)));
+        // A chunk that continues a stopped-engine checkpoint with the crank now commanded to 900 rpm.
+        let req = Request::Run(RunReq { board: Board::H2, budget: 1000, inputs: CRANKING, checkpoint: Some(cp(1000)) });
         let Ok(Outcome::Run(r)) = parse(&req, XSI2, 0, &h2_json()) else { panic!("{:?}", parse(&req, XSI2, 0, &h2_json())) };
         assert_eq!((r.start, r.executed, r.rti, r.main_loop.sp, r.interrupts[1].name.as_str()), (1000, 2000, 4, Some((0x27FF, 0x27FF)), "TOF"));
-        assert_eq!(r.checkpoint.as_ref().map(|c| c.inst), Some(2000));
+        assert_eq!(r.checkpoint.as_ref().map(|c| (c.inst, c.inputs)), Some((2000, CRANKING))); // sealed with the new inputs
         assert_eq!(r.eeprom.as_ref().map(|e| e.2.len()), Some(512));
+        assert_eq!((r.crank.as_ref().map(|c| (c.tooth, c.tic3)), r.inputs_changed.clone()), (Some((Some(21), Some(0x1234))), vec!["crank_rpm".to_string()]));
+        assert_eq!((r.trace[1].probe.clone(), r.probe(0xBB), r.ram(0x2000), r.ram(0x1000)), (vec![0x40], Some(0), Some(0), None));
         // the response must continue exactly the checkpoint and inputs that were sent
-        assert!(parse(&run_req(Board::H2, 1000, Some(cp(999))), XSI2, 0, &h2_json()).is_err());
-        assert!(parse(&run_req(Board::H2, 1000, None), XSI2, 0, &h2_json()).is_err());
-        let other = Request::Run(RunReq { board: Board::H2, budget: 1000, inputs: Inputs { in1060: 0x20, ..Inputs::default() }, checkpoint: Some(cp(1000)) });
+        assert!(parse(&Request::Run(RunReq { checkpoint: Some(cp(999)), ..match &req { Request::Run(r) => r.clone(), _ => unreachable!() } }), XSI2, 0, &h2_json()).is_err());
+        assert!(parse(&run_req(Board::H2, 1000, Some(cp(1000))), XSI2, 0, &h2_json()).is_err()); // other inputs
+        let other = Request::Run(RunReq { board: Board::H2, budget: 1000, inputs: Inputs { in1060: 0x20, ..CRANKING }, checkpoint: Some(cp(1000)) });
         assert!(parse(&other, XSI2, 0, &h2_json()).is_err());
         for (k, bad) in [
             ("rti", json!(5)),                     // more returns than entries
@@ -851,6 +977,11 @@ mod tests {
             ("samples", json!([[0, 0, 0xB800], [2000, 8000, 0xD4A5]])), // must start at the checkpoint
             ("loop", json!({"pc": 0xD4A2, "count": 5, "sp_min": null, "sp_max": null, "gap_max": 0})),
             ("events", json!([[0, 1500, 6000, 0x743C, "I", 0xFFDE, 256]])),
+            ("trace", json!([[1000, 4000, 9, 0x41], [2000, 8000, 7, 0x40]])), // edges never go back
+            ("trace", json!([[1000, 4000, 7], [2000, 8000, 9]])),             // one byte per probe
+            ("crank", Value::Null),                                          // H2 reports its crank signal
+            ("crank", json!({"rpm": 800, "edges": 9, "position": 40, "tooth": 21, "level": 0, "pacnt": 0, "tic3": null})),
+            ("crank", json!({"rpm": 900, "edges": 9, "position": 117, "tooth": 59, "level": 1, "pacnt": 0, "tic3": null})),
         ] {
             let mut v = h2_json();
             v[k] = bad;
@@ -859,7 +990,7 @@ mod tests {
     }
 
     fn lookup_json() -> Value {
-        json!({"version": 3, "ok": true, "action": "lookup", "sha256": XSI2, "working_sha256": XSI2, "edits": 0,
+        json!({"version": 4, "ok": true, "action": "lookup", "sha256": XSI2, "working_sha256": XSI2, "edits": 0,
             "row": 7, "column": 3, "row_fraction": 192, "column_fraction": 64, "result": 147, "instructions": 38,
             "cells": [[0x91AB + 66, 148], [0x91AB + 67, 187], [0x91AB + 75, 132], [0x91AB + 76, 175]], "registers": regs_json(0xB218, 147)})
     }
@@ -885,13 +1016,16 @@ mod tests {
         assert!(request_json(&RUN(), sim, &img, &"0".repeat(64), &[]).unwrap_err().starts_with("unsupported"));
         assert!(request_json(&run_req(Board::H1, MAX_RUN + 1, None), sim, &img, XSI2, &[]).is_err());
         let v: Value = serde_json::from_str(&request_json(&run_req(Board::H1, 7, None), sim, &img, XSI2, &[]).unwrap()).unwrap();
-        assert_eq!((v["action"].clone(), v["profile"].clone(), v["budget"].clone(), v["version"].clone()), (json!("run"), json!("h1"), json!(7), json!(3)));
-        assert_eq!((v["inputs"].clone(), v["checkpoint"].clone()), (Value::Null, Value::Null)); // H1 takes no inputs
-        let v: Value = serde_json::from_str(&request_json(&run_req(Board::H2, 7, Some(cp(5))), sim, &img, XSI2, &[]).unwrap()).unwrap();
-        assert_eq!((v["inputs"]["portd_in"].clone(), v["inputs"]["adc"][7].clone()), (json!(0x3F), json!(0x80)));
-        assert_eq!(v["checkpoint"], json!({"state": "s", "digest": "d"}));
-        let bad = Request::Run(RunReq { board: Board::H2, budget: 7, inputs: Inputs { portd_in: 64, ..Inputs::default() }, checkpoint: None });
-        assert!(request_json(&bad, sim, &img, XSI2, &[]).is_err());
+        assert_eq!((v["action"].clone(), v["profile"].clone(), v["budget"].clone(), v["version"].clone()), (json!("run"), json!("h1"), json!(7), json!(4)));
+        assert_eq!((v["inputs"].clone(), v["checkpoint"].clone(), v["checkpoint_inputs"].clone()), (Value::Null, Value::Null, Value::Null)); // H1 takes no inputs
+        let live = Request::Run(RunReq { board: Board::H2, budget: 7, inputs: CRANKING, checkpoint: Some(cp(5)) });
+        let v: Value = serde_json::from_str(&request_json(&live, sim, &img, XSI2, &[]).unwrap()).unwrap();
+        assert_eq!((v["inputs"]["portd_in"].clone(), v["inputs"]["adc"][7].clone(), v["inputs"]["crank_rpm"].clone()), (json!(0x3F), json!(0x80), json!(900)));
+        assert_eq!((v["checkpoint"].clone(), v["checkpoint_inputs"]["crank_rpm"].clone()), (json!({"state": "s", "digest": "d"}), json!(0)));
+        for inputs in [Inputs { portd_in: 64, ..Inputs::default() }, Inputs { porta_in: 0x80, ..Inputs::default() }, Inputs { crank_rpm: CRANK_MAX + 1, ..Inputs::default() }] {
+            let bad = Request::Run(RunReq { board: Board::H2, budget: 7, inputs, checkpoint: None });
+            assert!(request_json(&bad, sim, &img, XSI2, &[]).is_err(), "{inputs:?}");
+        }
         assert!(request_json(&Request::Lookup(Coord { row: 23, ..C }), sim, &img, XSI2, &[]).is_err());
         assert!(request_json(&Request::Lookup(Coord { col: 8, ..C }), sim, &img, XSI2, &[]).is_err());
         assert!(request_json(&Request::Lookup(C), sim, &img, XSI2, &[(0x9283, 1)]).is_err());
@@ -915,7 +1049,8 @@ mod tests {
 
     fn backend() -> Option<(PathBuf, Vec<u8>)> {
         let sim = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ucsim/src/sims/m68hc11.src/ucsim_m68hc11");
-        let img = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../106XSI2.ORI")).ok()?;
+        let dir = std::env::var_os("DUMP_DIR").map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."), PathBuf::from);
+        let img = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(dir).join("106XSI2.ORI")).ok()?;
         sim.is_file().then_some((sim, img))
     }
 
@@ -967,8 +1102,17 @@ mod tests {
         assert_eq!(one.main_loop.sp, Some((0x27FF, 0x27FF)));
         let entries: u64 = one.interrupts.iter().map(|i| i.count).sum();
         assert!(one.interrupts.iter().any(|i| i.name == "TOF" && i.count >= 10) && entries - one.rti <= 1, "{:?}", one.interrupts);
-        // A checkpoint of one input set is refused for another.
-        let other = Request::Run(RunReq { board: Board::H2, budget: 10, inputs: Inputs { in1060: 0x20, ..Inputs::default() }, checkpoint: a.checkpoint.clone() });
+        // Inputs change at a chunk boundary without a reset; a checkpoint claimed for other inputs is refused.
+        let crank = Inputs { crank_rpm: 900, ..Inputs::default() };
+        let mut c = go(&sim, &img, Request::Run(RunReq { board: Board::H2, budget: MAX_RUN, inputs: crank, checkpoint: one.checkpoint.clone() }));
+        assert_eq!((c.start, c.inputs_changed.clone()), (900_000, vec!["crank_rpm".to_string()]));
+        c = go(&sim, &img, Request::Run(RunReq { board: Board::H2, budget: MAX_RUN, inputs: crank, checkpoint: c.checkpoint.clone() }));
+        let period = u16::from_be_bytes([c.ram(0xBB).unwrap(), c.ram(0xBC).unwrap()]);
+        let rpm = u16::from_be_bytes([c.ram(0xD1).unwrap(), c.ram(0xD2).unwrap()]);
+        assert!(period.abs_diff(16_667) <= 2 && rpm.abs_diff(900) <= 2, "{period} {rpm}"); // computed by the firmware
+        assert!(c.crank.as_ref().is_some_and(|k| k.edges > 1000) && c.trace.len() == c.samples.len());
+        let forged = Checkpoint { inputs: Inputs { in1060: 0x20, ..Inputs::default() }, ..a.checkpoint.clone().unwrap() };
+        let other = Request::Run(RunReq { board: Board::H2, budget: 10, inputs: Inputs::default(), checkpoint: Some(forged) });
         assert!(run(&other, &sim, &img, XSI2, &[], &NO).unwrap_err().contains("another source, profile or input set"));
         // Cancellation stops the backend at once.
         let cancel = AtomicBool::new(true);

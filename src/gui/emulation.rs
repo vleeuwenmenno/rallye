@@ -1,7 +1,8 @@
 //! Emulation tab: the original firmware from reset on the patched µCsim board model, plus one
 //! isolated lookup. A session runs in bounded chunks; each chunk continues from the previous
-//! chunk's checkpoint in a fresh simulator process, until Pause, Reset or a blocker. Nothing here
-//! is an engine model: under H2 the engine is stopped and every input is a named raw value.
+//! chunk's checkpoint in a fresh simulator process, until Pause, Reset or a blocker. Under H2 the
+//! inputs (a commanded crank-wheel speed and raw sensor values) may change between chunks without
+//! a reset. Nothing here is an engine model: speed is commanded, never derived from throttle.
 
 use super::*;
 use crate::emu::{self, Board, Coord, Inputs, Outcome, Request, RunReq};
@@ -13,6 +14,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const CHUNK: u32 = emu::MAX_RUN;
 /// PC samples kept for the timeline across chunks; older ones are dropped.
 const TRAIL: usize = 1024;
+/// Firmware-reading samples kept for the engine plots (64 per request, about 20 requests).
+const HISTORY: usize = 1280;
+/// The A/D channel the firmware trace makes the throttle candidate (AN2 → $2003 → $C6, see the docs).
+const TPS_CANDIDATE: usize = 2;
+const NO_PERIOD: u16 = 0xFFFF;
+
+/// One firmware-reading sample for the engine plots.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Point {
+    inst: u64,
+    /// Commanded crank speed during the request (stimulus).
+    commanded: u16,
+    /// $D1:$D2 when the firmware has a valid period ($BB ≠ $FFFF).
+    firmware: Option<u16>,
+    /// Raw A/D input of AN2, and the firmware's validated AN2 value $C6.
+    tps_in: u8,
+    tps_fw: u8,
+}
 
 /// Identity of the bytes a result was computed from. Results for any other snapshot are never shown.
 #[derive(Clone, PartialEq)]
@@ -31,6 +50,7 @@ pub(super) struct Session {
     result: Result<emu::Run, String>,
     /// (instruction, E cycle, PC) across all chunks, oldest first.
     trail: VecDeque<(u64, u64, u16)>,
+    history: VecDeque<Point>,
     chunks: u64,
 }
 
@@ -45,6 +65,13 @@ pub(super) struct Emu {
     board: Board,
     inputs: Inputs,
     raw: bool,
+    /// Raw H2 input controls shown (the engine card covers crank speed and throttle).
+    raw_inputs: bool,
+    /// Crank speed the Start button commands; inputs.crank_rpm is 0 while stopped.
+    crank_target: u16,
+    /// Throttle stimulus A/D channel and (closed, open) raw endpoints (None: calibration defaults).
+    tps_ch: usize,
+    tps_ends: Option<(u8, u8)>,
     coord: Coord,
     session: Option<Session>,
     lookup: Option<(Snap, Result<emu::Lookup, String>)>,
@@ -61,6 +88,10 @@ impl Default for Emu {
             board: Board::H2,
             inputs: Inputs::default(),
             raw: false,
+            raw_inputs: false,
+            crank_target: 900,
+            tps_ch: TPS_CANDIDATE,
+            tps_ends: None,
             coord: Coord { row: 7, col: 3, row_frac: 192, col_frac: 64 },
             session: None,
             lookup: None,
@@ -121,6 +152,14 @@ impl Field {
     }
 }
 
+/// Display the actual selected raw stimulus, including raw edits and channel changes.
+fn throttle_percent(raw: u8, (closed, open): (u8, u8)) -> Option<u8> {
+    if closed == open || raw < closed.min(open) || raw > closed.max(open) {
+        return None;
+    }
+    Some(((raw as f64 - closed as f64) * 100. / (open as f64 - closed as f64)).round() as u8)
+}
+
 const MONO: &str = "JetBrainsMono Nerd Font";
 const OK: u32 = 0x5cc98a;
 
@@ -154,6 +193,22 @@ fn continuation(s: Option<&Session>) -> Option<Option<emu::Checkpoint>> {
     }
 }
 
+/// Firmware speed and throttle readings of a request's samples, appended to the bounded history.
+fn extend_history(history: &mut VecDeque<Point>, run: &emu::Run) {
+    let (Some(bb), Some(d1), Some(c6)) = (run.probe(0xBB), run.probe(0xD1), run.probe(0xC6)) else { return };
+    for t in &run.trace {
+        if history.back().is_some_and(|p| p.inst >= t.inst) {
+            continue; // a chunk's first sample repeats the previous chunk's last one
+        }
+        let word = |k: usize| u16::from_be_bytes([t.probe[k], t.probe[k + 1]]);
+        let firmware = (word(bb) != NO_PERIOD).then(|| word(d1));
+        history.push_back(Point { inst: t.inst, commanded: run.inputs.crank_rpm, firmware, tps_in: run.inputs.adc[TPS_CANDIDATE], tps_fw: t.probe[c6] });
+    }
+    while history.len() > HISTORY {
+        history.pop_front();
+    }
+}
+
 /// Append a chunk's samples to the bounded trail (its first sample repeats the previous last one).
 fn extend_trail(trail: &mut VecDeque<(u64, u64, u16)>, samples: &[(u64, u64, u16)]) {
     for &s in samples {
@@ -176,15 +231,17 @@ impl Rallye {
         Some(Snap::new(d.path.clone(), d.sha256.clone(), Some(self.bytes_of(d))))
     }
 
-    /// The session for the current bytes, profile and inputs, if any; never a stale one.
+    /// The session for the current bytes and profile, if any; never a stale one. Its inputs may
+    /// differ from the current ones: they take effect at the next chunk boundary.
     fn emu_session(&self) -> Option<&Session> {
         let snap = self.emu_snap();
-        let inputs = self.emu.effective_inputs();
-        self.emu.session.as_ref().filter(|s| Some(&s.snap) == snap.as_ref() && s.board == self.emu.board && s.inputs == inputs)
+        self.emu.session.as_ref().filter(|s| Some(&s.snap) == snap.as_ref() && s.board == self.emu.board)
     }
 
     /// Run one backend request off the UI thread. A Run result is kept only if the session identity
-    /// (target bytes, working bytes, profile, inputs) is unchanged and no newer request was issued.
+    /// (target bytes, working bytes, profile) is unchanged and no newer request was issued. Inputs
+    /// changed meanwhile do not invalidate it: the result belongs to the inputs it ran with, and the
+    /// next chunk applies the new ones from its checkpoint on.
     fn emu_run(&mut self, req: Request, cx: &mut Context<Self>) {
         let (Some(d), Some(snap)) = (self.emu_target(), self.emu_snap()) else { return };
         if self.emu.busy {
@@ -213,16 +270,19 @@ impl Rallye {
                     return; // reset, replaced or cancelled meanwhile
                 }
                 this.emu.busy = false;
-                if this.emu_snap().as_ref() != Some(&snap) || this.emu.board != board || this.emu.effective_inputs() != inputs {
+                if this.emu_snap().as_ref() != Some(&snap) || this.emu.board != board {
                     this.emu.reset_session();
-                    this.msg = Some(("Emulation result discarded: the target, its working copy, the profile or the inputs changed while it ran".into(), WARN));
+                    this.msg = Some(("Emulation result discarded: the target, its working copy or the profile changed while it ran".into(), WARN));
                     return cx.notify();
                 }
                 this.emu_store(snap, board, inputs, r.map_err(|e| e.to_string()), lookup);
-                // Continue a Run with the next chunk; Pause, a blocker or an error ends it.
+                // Continue a Run with the next chunk and the current inputs; Pause, a blocker or an error ends it.
                 if this.emu.running && !lookup {
                     match continuation(this.emu_session()) {
-                        Some(Some(c)) => this.emu_run(Request::Run(RunReq { board, budget: CHUNK, inputs, checkpoint: Some(c) }), cx),
+                        Some(Some(c)) => {
+                            let inputs = this.emu.effective_inputs();
+                            this.emu_run(Request::Run(RunReq { board, budget: CHUNK, inputs, checkpoint: Some(c) }), cx)
+                        }
                         _ => this.emu.running = false,
                     }
                 }
@@ -245,12 +305,13 @@ impl Rallye {
                 if result.is_err() {
                     self.emu.running = false;
                 }
-                let keep = self.emu.session.take().filter(|s| s.snap == snap && s.board == board && s.inputs == inputs);
-                let (mut trail, chunks) = keep.map_or((VecDeque::new(), 0), |s| (s.trail, s.chunks));
+                let keep = self.emu.session.take().filter(|s| s.snap == snap && s.board == board);
+                let (mut trail, mut history, chunks) = keep.map_or((VecDeque::new(), VecDeque::new(), 0), |s| (s.trail, s.history, s.chunks));
                 if let Ok(run) = &result {
                     extend_trail(&mut trail, &run.samples);
+                    extend_history(&mut history, run);
                 }
-                self.emu.session = Some(Session { snap, board, inputs, result, trail, chunks: chunks + 1 });
+                self.emu.session = Some(Session { snap, board, inputs, result, trail, history, chunks: chunks + 1 });
             }
         }
     }
@@ -293,16 +354,39 @@ impl Rallye {
         row
     }
 
-    /// Change one H2 input. Inputs are part of the session identity, so a running session is reset.
+    /// Change one H2 input. It takes effect at the next chunk boundary without a reset, except the
+    /// EEPROM power-up fill, which only matters at the first EEPROM access and so resets the session.
     fn set_input(&mut self, field: Field, value: u8) {
         if *field.get(&mut self.emu.inputs) == value {
             return;
         }
         *field.get(&mut self.emu.inputs) = value;
-        if self.emu.session.is_some() || self.emu.busy {
+        if matches!(field, Field::Fill) && (self.emu.session.is_some() || self.emu.busy) {
             self.emu.reset_session();
-            self.emu.note = Some("Inputs changed: they are part of the session identity, so the session was reset. Run starts again from reset with the new inputs.".into());
+            self.emu.note = Some("EEPROM fill changed: it only applies at power-up, so the session was reset. Run starts again from reset.".into());
         }
+    }
+
+    fn set_crank(&mut self, rpm: u16) {
+        self.emu.inputs.crank_rpm = rpm.min(emu::CRANK_MAX);
+    }
+
+    /// (closed, open) raw endpoints of the throttle stimulus: explicit, else the calibration bytes the
+    /// firmware loads as its initial learned endpoints ($88FE → $0E, $88FD → $0D).
+    fn tps_ends(&self) -> (u8, u8) {
+        self.emu.tps_ends.unwrap_or_else(|| self.emu_target().map_or((0x40, 0xD0), |d| (d.bytes[0x88FE], d.bytes[0x88FD])))
+    }
+
+    /// Current input expressed between the selected endpoints, or unknown when outside them.
+    fn tps_pct(&self) -> Option<u8> {
+        throttle_percent(self.emu.inputs.adc[self.emu.tps_ch], self.tps_ends())
+    }
+
+    /// Write the requested percentage into the selected A/D channel.
+    fn apply_tps(&mut self, pct: u8) {
+        let (closed, open) = self.tps_ends();
+        let raw = closed as i32 + ((open as f64 - closed as f64) * pct as f64 / 100.).round() as i32;
+        self.set_input(Field::Adc(self.emu.tps_ch), raw.clamp(0, 255) as u8);
     }
 
     /// One byte input as eight bit toggles (bit 7 left); `used` marks bits the firmware is known to read.
@@ -354,11 +438,11 @@ impl Rallye {
             .rounded_md()
             .border_1()
             .border_color(rgb(WARN))
-            .child(heading("H2 SIMULATED INPUTS · RAW UNITS · HYPOTHETICAL DEFAULTS · PHYSICAL MEANING OF EVERY INPUT UNKNOWN"))
-            .child(line("Constant for the whole session (the engine is stopped: no crank or input-capture edges). Changing any input resets the session. * = bit the firmware is seen to read.", WARN))
+            .child(heading("H2 RAW INPUTS · RAW UNITS · HYPOTHETICAL DEFAULTS · PHYSICAL MEANING UNKNOWN UNLESS NOTED"))
+            .child(line("A change applies at the next chunk boundary (the session continues; only the EEPROM fill resets it). The throttle control above writes its channel here. * = bit the firmware is seen to read.", WARN))
             .child(self.bit_row("i60-", "Board input byte $1060", 0xFF, &[(5, "branch at $A86A"), (1, "stored at $A035")], Field::In1060, cx))
             .child(self.bit_row("i80-", "Board input byte $1080", 0xFF, &[(4, "tested at $BB51/$BB61")], Field::In1080, cx))
-            .child(self.bit_row("pa-", "PORTA input pins PA7, PA2–PA0", 0x87, &[], Field::PortA, cx))
+            .child(self.bit_row("pa-", "PORTA input pins PA2, PA1 (PA7/PA0: crank)", 0x06, &[], Field::PortA, cx))
             .child(self.bit_row("pd-", "PORTD input pins PD5–PD0", 0x3F, &[(5, "SPI SS level (low = mode fault)")], Field::PortD, cx))
             .child(adc)
             .child(self.byte_stepper("eefill".into(), "Internal EEPROM power-up fill byte".into(), i.eeprom_fill, Field::Fill, cx))
@@ -383,11 +467,11 @@ impl Rallye {
             )));
         };
         head = head.child(kv("Backend", emu::simulator().map_or_else(|e| e, |p| format!("µCsim {}", p.display()))));
-        root.child(head).child(self.run_card(cx)).child(self.lookup_card(d, cx)).child(
+        root.child(head).child(self.engine_card(cx)).child(self.run_card(cx)).child(self.lookup_card(d, cx)).child(
             card()
                 .child(heading("ENGINE OUTPUTS"))
-                .child(line("Engine stopped. RPM, injector pulse width and ignition timing are NOT simulated: there is no crank signal, and no output pin or SPI byte has been mapped to an injector or coil.", WARN))
-                .child(line("Available instead: raw PORTA output-compare pins, SPI frames and SCI characters the firmware produces with the engine stopped (see the run above), map reads in the isolated lookup below.", MUTED)),
+                .child(line("Injector pulse width and ignition timing are NOT shown as such: no output pin, latch bit or SPI byte has been mapped to an injector or coil. There is no engine model: the crank speed is commanded, not produced by combustion, and throttle does not change it.", WARN))
+                .child(line("Available instead: the firmware's own speed and throttle readings (engine-input card), raw PORTA output-compare pins with their last pulse widths, latch bit activity, SPI frames and SCI characters (run below), map reads in the isolated lookup.", MUTED)),
         )
     }
 
@@ -431,19 +515,28 @@ impl Rallye {
             Some(Ok(_)) => ("PAUSED · Run continues from the checkpoint", WARN),
         };
         let mut c = card()
-            .child(heading("FIRMWARE FROM RESET · ORIGINAL SOURCE BYTES · KEY ON, ENGINE STOPPED"))
+            .child(heading("FIRMWARE FROM RESET · ORIGINAL SOURCE BYTES · KEY ON"))
             .child(profiles)
             .child(controls)
             .child(div().h(px(18.)).text_sm().font_weight(FontWeight::BOLD).text_color(rgb(color)).child(state))
             .child(line(
-                format!("Run executes {CHUNK} instructions per backend request and continues from that request's checkpoint (exact continuation, tested against one long run) until Pause, Reset or a blocker; there is no total cap. Execution stops before the first instruction that needs unmodelled hardware or uses an opcode without a conformance case. Session edits are not used, but any edit resets the session."),
+                format!("Run executes {CHUNK} instructions per backend request and continues from that request's checkpoint (exact continuation, tested against one long run) until Pause, Reset or a blocker; there is no total cap. H2 input changes apply at the next request boundary. Execution stops before the first instruction that needs unmodelled hardware or uses an opcode without a conformance case. Session edits are not used, but any edit resets the session."),
                 MUTED,
             ));
         match self.emu.board {
             Board::H1 => {
                 c = c.child(div().p_2().rounded_md().border_1().border_color(rgb(WARN)).child(line("H1 is a working hypothesis, not a validated ECU board: $1040/$1050 writes are treated as write-only latches with unknown effect, EPROM-address writes of the byte already there are dropped, and the diagnostic serial line is idle. Any other external access still stops.", WARN)))
             }
-            Board::H2 => c = c.child(self.inputs_panel(cx)),
+            Board::H2 => {
+                let toggle = btn("raw-inputs", if self.emu.raw_inputs { "Hide raw inputs" } else { "Show raw inputs ($1060, $1080, ports, A/D, EEPROM fill)" }, self.emu.raw_inputs).on_click(cx.listener(|this, _, _, cx| {
+                    this.emu.raw_inputs = !this.emu.raw_inputs;
+                    cx.notify();
+                }));
+                c = c.child(div().flex().child(toggle));
+                if self.emu.raw_inputs {
+                    c = c.child(self.inputs_panel(cx));
+                }
+            }
             Board::Strict => {}
         }
         if let Some(n) = &self.emu.note {
@@ -514,7 +607,9 @@ impl Rallye {
     /// Raw output activity; which actuator (if any) each signal drives is unknown.
     fn outputs(&self, r: &emu::Run) -> Div {
         let o = &r.outputs;
-        let pins: String = (3..8).rev().map(|b| format!("PA{b}={} ({} changes)  ", (o.porta_pins >> b) & 1, o.porta_changes[b])).collect();
+        let width = |c: u64| if c == 0 { "—".to_string() } else { format!("{:.2} ms", ms(c)) };
+        let pins: String = (3..8).rev().map(|b| format!("PA{b}={} ({} changes, last high {}, low {})  ", (o.porta_pins >> b) & 1, o.porta_changes[b], width(o.porta_high[b]), width(o.porta_low[b]))).collect();
+        let latch = |base: usize| (0..8).rev().map(|b| o.latch_changes[base + b].to_string()).collect::<Vec<_>>().join(" ");
         let bytes = |v: &[u8]| v.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
         let mut c = div()
             .flex()
@@ -524,6 +619,7 @@ impl Rallye {
             .child(heading("RAW OUTPUTS · MAPPING TO ACTUATORS UNKNOWN"))
             .child(kv("PORTA output pins", pins).font_family(MONO))
             .child(kv("PORTA latch", format!("${:02X}", o.porta_latch)).font_family(MONO))
+            .child(kv("Latch bit changes b7…b0", format!("$1040: {} · $1050: {}", latch(0), latch(8))).font_family(MONO))
             .child(kv("SPI bytes sent", format!("{} · last: {}", o.spi_bytes, bytes(&o.spi_last))).font_family(MONO))
             .child(kv("SCI characters sent", format!("{} · last: {}", o.sci_bytes, bytes(&o.sci_last))).font_family(MONO))
             .child(line("SPI/SCI received data is unknown in every profile; the firmware may only load it and discard it, otherwise the run stops.", MUTED));
@@ -828,6 +924,169 @@ impl Rallye {
         c
     }
 
+    /// A row of buttons that each run `on(this, value)`; `active` marks the current value.
+    fn choice_row<T: Copy + PartialEq + 'static>(&self, id: &'static str, label: &str, items: &[(T, String)], active: Option<T>, on: fn(&mut Self, T), cx: &mut Context<Self>) -> Div {
+        let mut row = div().flex().flex_wrap().items_center().gap_1().child(div().w(px(150.)).flex_none().text_xs().text_color(rgb(MUTED)).child(label.to_string()));
+        for (k, (v, text)) in items.iter().enumerate() {
+            let v = *v;
+            row = row.child(btn(SharedString::from(format!("{id}{k}")), text.clone(), active == Some(v)).on_click(cx.listener(move |this, _, _, cx| {
+                on(this, v);
+                cx.notify();
+            })));
+        }
+        row
+    }
+
+    /// Top-level engine inputs: commanded crank speed and a throttle stimulus, with the firmware's own
+    /// readings next to them. Requested values are stimuli; measured values come from firmware RAM.
+    fn engine_card(&self, cx: &mut Context<Self>) -> Div {
+        let mut c = card().child(heading("ENGINE INPUTS · SIMULATED CRANK SIGNAL AND THROTTLE STIMULUS · NO ENGINE MODEL"));
+        if self.emu.board != Board::H2 {
+            return c.child(line("Crank and throttle inputs need the H2 simulation profile (select it below).", MUTED));
+        }
+        let i = self.emu.inputs;
+        let running = i.crank_rpm > 0;
+        let start = btn("crank-toggle", if running { "■ Stop crank" } else { "▶ Start crank" }, running).on_click(cx.listener(|this, _, _, cx| {
+            let rpm = if this.emu.inputs.crank_rpm > 0 { 0 } else { this.emu.crank_target };
+            this.set_crank(rpm);
+            cx.notify();
+        }));
+        let target = self.emu.crank_target;
+        let mut speed = div().flex().flex_wrap().items_center().gap_1().child(div().w(px(150.)).flex_none().text_xs().text_color(rgb(MUTED)).child("Commanded speed"));
+        for (k, delta) in [-500i32, -100, -10, 10, 100, 500].into_iter().enumerate() {
+            if k == 3 {
+                speed = speed.child(div().w(px(80.)).flex().justify_center().font_family(MONO).text_sm().child(format!("{target} rpm")));
+            }
+            let text = if delta < 0 { format!("−{}", -delta) } else { format!("+{delta}") };
+            speed = speed.child(btn(SharedString::from(format!("rpm{k}")), text, false).on_click(cx.listener(move |this, _, _, cx| {
+                this.emu.crank_target = (this.emu.crank_target as i32 + delta).clamp(30, emu::CRANK_MAX as i32) as u16;
+                if this.emu.inputs.crank_rpm > 0 {
+                    this.set_crank(this.emu.crank_target);
+                }
+                cx.notify();
+            })));
+        }
+        let presets: Vec<(u16, String)> = [(250, "250 cranking"), (900, "900 idle"), (3000, "3000"), (6000, "6000")].iter().map(|&(v, t)| (v, t.to_string())).collect();
+        let speed_presets = self.choice_row("rpmp", "Presets (start crank)", &presets, running.then_some(i.crank_rpm), |this, v| {
+            this.emu.crank_target = v;
+            this.set_crank(v);
+        }, cx);
+        let pct = self.tps_pct();
+        let mut throttle = div().flex().flex_wrap().items_center().gap_1().child(div().w(px(150.)).flex_none().text_xs().text_color(rgb(MUTED)).child("Throttle stimulus"));
+        for (k, delta) in [-10i32, -1, 1, 10].into_iter().enumerate() {
+            if k == 2 {
+                throttle = throttle.child(div().w(px(80.)).flex().justify_center().font_family(MONO).text_sm().child(pct.map_or_else(|| "—".into(), |v| format!("{v} %"))));
+            }
+            let text = if delta < 0 { format!("−{}", -delta) } else { format!("+{delta}") };
+            throttle = throttle.child(btn(SharedString::from(format!("tps{k}")), text, false).on_click(cx.listener(move |this, _, _, cx| {
+                let pct = (this.tps_pct().unwrap_or(0) as i32 + delta).clamp(0, 100) as u8;
+                this.apply_tps(pct);
+                cx.notify();
+            })));
+        }
+        let pcts: Vec<(u8, String)> = [0u8, 25, 50, 75, 100].iter().map(|&v| (v, format!("{v} %"))).collect();
+        let tps_presets = self.choice_row("tpsp", "Throttle presets", &pcts, pct, |this, v| {
+            this.apply_tps(v);
+        }, cx);
+        let channels: Vec<(usize, String)> = (0..8).map(|k| (k, if k == TPS_CANDIDATE { format!("AN{k} (candidate)") } else { format!("AN{k}") })).collect();
+        let channel = self.choice_row("tpsch", "Throttle A/D channel", &channels, Some(self.emu.tps_ch), |this, k| {
+            this.emu.tps_ch = k;
+        }, cx);
+        let (closed, open) = self.tps_ends();
+        let mut ends = div().flex().flex_wrap().items_center().gap_1().child(div().w(px(150.)).flex_none().text_xs().text_color(rgb(MUTED)).child("Endpoints (raw)"));
+        for (k, (label, delta, is_open)) in [("closed −", -1i32, false), ("closed +", 1, false), ("open −", -1, true), ("open +", 1, true)].into_iter().enumerate() {
+            ends = ends.child(btn(SharedString::from(format!("tpse{k}")), label, false).on_click(cx.listener(move |this, _, _, cx| {
+                let pct = this.tps_pct().unwrap_or(0);
+                let (mut c0, mut o0) = this.tps_ends();
+                let v = if is_open { &mut o0 } else { &mut c0 };
+                *v = (*v as i32 + delta * 4).clamp(0, 255) as u8;
+                this.emu.tps_ends = Some((c0, o0));
+                this.apply_tps(pct);
+                cx.notify();
+            })));
+        }
+        ends = ends
+            .child(div().font_family(MONO).text_xs().child(format!("closed {closed} (${closed:02X}) · open {open} (${open:02X}) · now writes AN{} = {}", self.emu.tps_ch, i.adc[self.emu.tps_ch])))
+            .child(btn("tpse-cal", "calibration defaults", self.emu.tps_ends.is_none()).on_click(cx.listener(|this, _, _, cx| {
+                this.emu.tps_ends = None;
+                cx.notify();
+            })));
+        c = c
+            .child(div().flex().items_center().gap_2().child(start).child(line(if running { format!("crank turning at {} rpm (commanded)", i.crank_rpm) } else { "crank stopped (0 rpm commanded)".into() }, if running { OK } else { MUTED })))
+            .child(speed)
+            .child(speed_presets)
+            .child(throttle)
+            .child(tps_presets)
+            .child(channel)
+            .child(ends)
+            .child(line("Crank: a 60-2 wheel signal (58 teeth, gap after tooth 58) on PA7/PAI and PA0/IC3, falling edge active, as the firmware's own timer setup and tooth decoder imply; board wiring, sensor polarity and the 2 MHz E clock that converts rpm to timer counts are unverified. Speed and throttle are independent stimuli: throttle never changes speed.", WARN))
+            .child(line("Throttle: AN2 is the candidate from the firmware trace (range check, closed/open flags and endpoint learning on its copy $2003 → $C6); not proven on hardware. Percent maps linearly between the endpoints, which default to the calibration's initial learned values ($88FE closed, $88FD open). A change applies to A/D conversions completed after the next chunk boundary.", WARN));
+        let session = self.emu_session();
+        if let Some(s) = session.filter(|s| s.inputs != self.emu.inputs) {
+            let when = match continuation(Some(s)).flatten() {
+                _ if self.emu.busy => "at the end of the request in flight".to_string(),
+                Some(cp) => format!("from instruction {} when Run or Step continues", cp.inst),
+                None => "only after Reset (the session cannot continue)".to_string(),
+            };
+            c = c.child(line(format!("Input change pending: applies {when}; the session is not reset."), ACCENT));
+        }
+        let Some(Session { result: Ok(r), history, .. }) = session else {
+            return c.child(line("No firmware readings yet: press Run below. Readings come from the firmware's RAM after each request.", MUTED));
+        };
+        c.child(self.engine_readings(r)).child(self.engine_plots(history))
+    }
+
+    /// Firmware readings beside the stimulus, from RAM after the last instruction (see the docs for each address).
+    fn engine_readings(&self, r: &emu::Run) -> Div {
+        let b = |a: u16| r.ram(a).unwrap_or(0);
+        let w = |a: u16| u16::from_be_bytes([b(a), b(a + 1)]);
+        let period = w(0xBB);
+        let fw = if period == NO_PERIOD { "— (no valid period: $BB = $FFFF)".to_string() } else { format!("{} rpm", w(0xD1)) };
+        let regime = b(0xAE);
+        let crank = r.crank.as_ref().map_or("—".into(), |k| {
+            let tooth = k.tooth.map_or("gap".into(), |t| format!("tooth {t}"));
+            format!("{} falling edges · {tooth} · level {} · PACNT ${:02X} · TIC3 {}", k.edges, k.level, k.pacnt, k.tic3.map_or("—".into(), |t| format!("${t:04X}")))
+        });
+        let aa = b(0xAA);
+        let flags = format!("{}{}", if aa & 0x40 != 0 { "closed ($AA bit 6) " } else { "" }, if aa & 0x80 != 0 { "open ($AA bit 7)" } else { "" });
+        let fault = b(0x1B);
+        let ch = self.emu.tps_ch;
+        let mut t = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(heading("REQUESTED (STIMULUS) VS MEASURED (FIRMWARE RAM) · AFTER INSTRUCTION ".to_string() + &r.executed.to_string()))
+            .child(kv("Requested crank speed", format!("{} rpm", r.inputs.crank_rpm)).font_family(MONO))
+            .child(kv("Firmware speed $D1", fw).font_family(MONO).text_color(rgb(if period == NO_PERIOD { MUTED } else { OK })))
+            .child(kv("Firmware period $BB", if period == NO_PERIOD { "$FFFF (stopped or below about 229 rpm)".into() } else { format!("{period} timer counts per 30 teeth (= 180°)") }).font_family(MONO))
+            .child(kv("Firmware tooth / regime", format!("tooth $D8 = {} · regime $AE = {regime:08b} (bit 0: low-speed/stall mode) · gap check $AD bit 4 = {} · sync errors $2093 = {}", b(0xD8), (b(0xAD) >> 4) & 1, r.ram(0x2093).unwrap_or(0))).font_family(MONO))
+            .child(kv("Simulated crank signal", crank).font_family(MONO))
+            .child(kv(&format!("Throttle input AN{ch}"), format!("{} raw (applied in this completed run)", r.inputs.adc[ch])).font_family(MONO))
+            .child(kv("Firmware AN2 values", format!("copy $2003 = {} · validated $C6 = {} · processed $200F = {} · learned closed $0E = {} · open $0D = {} · {}", b(0x2003), b(0xC6), b(0x200F), b(0x0E), b(0x0D), if flags.is_empty() { "no endpoint flag" } else { flags.trim() })).font_family(MONO))
+            .child(kv("AN2 fault flags $1B", if fault == 0 { "none".into() } else { format!("${fault:02X} · the firmware substitutes a default instead of the raw value (range $9284..$9285, step limit $928A); Reset clears it") }).font_family(MONO).text_color(rgb(if fault == 0 { TEXT } else { WARN })))
+            .child(line("Firmware speed formula (code at $429B, not assumed): $D1:$D2 = 256·58594/$BB, i.e. 15,000,064/$BB; $BB is the TCNT time between teeth 20 and 50 ($9618). Reading it as rpm assumes the 2 MHz E clock and TMSK2 prescaler 4 (2 µs per count).", MUTED));
+        if ch != TPS_CANDIDATE {
+            t = t.child(line(format!("AN{ch} is selected: the firmware AN2 values above do not follow the throttle stimulus."), WARN));
+        }
+        t
+    }
+
+    /// Small live plots of the session's history: commanded vs firmware speed, throttle input vs $C6.
+    fn engine_plots(&self, history: &VecDeque<Point>) -> Div {
+        let rpm_max = history.iter().map(|p| p.commanded.max(p.firmware.unwrap_or(0))).max().unwrap_or(0).max(1000) as f32;
+        let rpm = plot(history, rpm_max, &[(|p: &Point| Some(p.commanded as f32), ACCENT), (|p: &Point| p.firmware.map(|f| f as f32), OK)]);
+        let tps = plot(history, 255., &[(|p: &Point| Some(p.tps_in as f32), ACCENT), (|p: &Point| Some(p.tps_fw as f32), OK)]);
+        let first = history.front().map_or(0, |p| p.inst);
+        let last = history.back().map_or(0, |p| p.inst);
+        div()
+            .flex()
+            .gap_4()
+            .items_start()
+            .child(div().flex().flex_col().gap_1().child(heading(format!("SPEED · BLUE COMMANDED, GREEN FIRMWARE $D1 · 0–{rpm_max:.0} RPM"))).child(rpm))
+            .child(div().flex().flex_col().gap_1().child(heading("THROTTLE AN2 · BLUE RAW INPUT, GREEN FIRMWARE $C6 · 0–255")).child(tps))
+            .child(line(format!("{} samples, instructions {first}–{last}; gaps in green: no valid period", history.len()), MUTED))
+    }
+
     fn lookup_card(&self, d: &Dump, cx: &mut Context<Self>) -> Div {
         let co = self.emu.coord;
         let source = match emu::table_edits(&d.bytes, self.bytes_of(d)) {
@@ -867,6 +1126,51 @@ impl Rallye {
             .child(kv("Source SHA-256", d.sha256.clone()))
             .child(kv("Working SHA-256", if l.edits > 0 { format!("{} · {} session edit(s) in the table", l.working_sha, l.edits) } else { format!("{} · original, no edits", l.working_sha) }))
     }
+}
+
+type Series = (fn(&Point) -> Option<f32>, u32);
+
+/// A small line plot of `series` over the history's instruction axis; a None value breaks the line.
+fn plot(history: &VecDeque<Point>, y_max: f32, series: &[Series]) -> Div {
+    const W: f32 = 340.;
+    const H: f32 = 90.;
+    let (first, last) = (history.front().map_or(0, |p| p.inst), history.back().map_or(1, |p| p.inst));
+    let span = (last - first).max(1) as f32;
+    type Runs = Vec<Vec<(f32, f32)>>;
+    let lines: Vec<(Runs, u32)> = series
+        .iter()
+        .map(|&(f, color)| {
+            let mut runs: Vec<Vec<(f32, f32)>> = vec![vec![]];
+            for p in history {
+                match f(p) {
+                    Some(v) => runs.last_mut().unwrap().push((4. + (W - 8.) * (p.inst - first) as f32 / span, 4. + (H - 8.) * (1. - (v / y_max).clamp(0., 1.)))),
+                    None if !runs.last().unwrap().is_empty() => runs.push(vec![]),
+                    None => {}
+                }
+            }
+            (runs, color)
+        })
+        .collect();
+    let cv = canvas(
+        |_, _, _| (),
+        move |b, _, window, _| {
+            let o = b.origin;
+            for (runs, color) in &lines {
+                for run in runs.iter().filter(|r| r.len() > 1) {
+                    let mut pb = PathBuilder::stroke(px(1.5));
+                    for (k, q) in run.iter().enumerate() {
+                        let pt = point(o.x + px(q.0), o.y + px(q.1));
+                        if k == 0 { pb.move_to(pt) } else { pb.line_to(pt) }
+                    }
+                    if let Ok(path) = pb.build() {
+                        window.paint_path(path, rgb(*color));
+                    }
+                }
+            }
+        },
+    )
+    .size_full();
+    div().w(px(W)).h(px(H)).rounded_md().bg(rgb(BG)).child(cv)
 }
 
 fn emu_reg_name(r: &emu::Run, addr: u16) -> String {
@@ -910,6 +1214,16 @@ fn four_cells(l: &emu::Lookup) -> Div {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn throttle_display_tracks_raw_input_and_endpoint_direction() {
+        assert_eq!(super::throttle_percent(128, (64, 208)), Some(44));
+        assert_eq!(super::throttle_percent(64, (64, 208)), Some(0));
+        assert_eq!(super::throttle_percent(208, (64, 208)), Some(100));
+        assert_eq!(super::throttle_percent(128, (208, 64)), Some(56));
+        assert_eq!(super::throttle_percent(0, (64, 208)), None);
+        assert_eq!(super::throttle_percent(64, (64, 64)), None);
+    }
+
     use super::*;
 
     #[test]
@@ -926,7 +1240,7 @@ mod tests {
     }
 
     fn session(result: Result<emu::Run, String>) -> Session {
-        Session { snap: Snap::new("dump.bin".into(), "source-sha".into(), None), board: Board::H2, inputs: Inputs::default(), result, trail: VecDeque::new(), chunks: 1 }
+        Session { snap: Snap::new("dump.bin".into(), "source-sha".into(), None), board: Board::H2, inputs: Inputs::default(), result, trail: VecDeque::new(), history: VecDeque::new(), chunks: 1 }
     }
 
     #[test]
@@ -945,13 +1259,14 @@ mod tests {
     fn run_at(executed: u64, blocked: bool) -> emu::Run {
         let regs = emu::Regs { pc: 0, sp: 0, a: 0, b: 0, x: 0, y: 0, cc: 0 };
         let blocker = blocked.then(|| emu::Blocker { pc: 0, bytes: String::new(), text: String::new(), kind: "read".into(), address: Some(0x1060), value: None, reason: String::new() });
-        let checkpoint = (!blocked).then(|| emu::Checkpoint { state: "s".into(), digest: "d".into(), inst: executed });
+        let checkpoint = (!blocked).then(|| emu::Checkpoint { state: "s".into(), digest: "d".into(), inst: executed, inputs: Inputs::default() });
         emu::Run {
             board: Board::H2, board_text: String::new(), core: String::new(), budget: CHUNK, start: 0, executed, cycles: 0, regs,
             samples: vec![], blocker, milestones: vec![], regions: vec![], io: vec![], latches: vec![], events: vec![], events_total: 0,
             pages: vec![], cop_services: 0, cop_cycle: 0, tcnt: 0, rom_same_writes: 0, opcodes: (0, 0), cop_gap_max: 0, watch: vec![],
             interrupts: vec![], rti: 0, main_loop: emu::Loop { pc: 0xD4A2, count: 0, sp: None, gap_max: 0 }, outputs: emu::Outputs::default(),
-            eeprom: None, ram_internal: vec![0; 256], ram_external: vec![0; 2048], checkpoint,
+            eeprom: None, ram_internal: vec![0; 256], ram_external: vec![0; 2048], inputs: Inputs::default(), inputs_changed: vec![],
+            probes: vec![], trace: vec![], crank: None, checkpoint,
         }
     }
 
@@ -962,6 +1277,20 @@ mod tests {
         assert_eq!(continuation(Some(&s)).flatten().map(|c| c.inst), Some(4_000_000)); // no total cap
         assert_eq!(continuation(Some(&session(Ok(run_at(68_202, true))))), None);
         assert_eq!(continuation(Some(&session(Err("backend failed".into())))), None);
+    }
+
+    #[test]
+    fn engine_history_reads_firmware_bytes_not_inputs() {
+        let mut run = run_at(2000, false);
+        run.inputs = Inputs { crank_rpm: 900, adc: [0, 0, 0x40, 0, 0, 0, 0, 0], ..Inputs::default() };
+        run.probes = vec![(0xBB, "p".into()), (0xBC, "p".into()), (0xD1, "r".into()), (0xD2, "r".into()), (0xC6, "t".into())];
+        let sample = |inst, probe: [u8; 5]| emu::Sample { inst, cycles: inst * 4, edges: 0, probe: probe.to_vec() };
+        // $BB = $FFFF: no firmware speed yet; then $BB = 16667, $D1 = 899 and $C6 lagging at $80.
+        run.trace = vec![sample(1000, [0xFF, 0xFF, 0, 0, 0x80]), sample(2000, [0x41, 0x1B, 0x03, 0x83, 0x80])];
+        let mut h = VecDeque::new();
+        extend_history(&mut h, &run);
+        extend_history(&mut h, &run); // the same samples again add nothing
+        assert_eq!(h.iter().map(|p| (p.commanded, p.firmware, p.tps_in, p.tps_fw)).collect::<Vec<_>>(), vec![(900, None, 0x40, 0x80), (900, Some(899), 0x40, 0x80)]);
     }
 
     #[test]

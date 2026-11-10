@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run bounded IAW8P firmware experiments with an external, patched µCsim.
 
-This is not an ECU or engine simulator. The patched simulator carries a research
+This is not an engine simulator: under H2 a commanded crank-wheel signal and raw sensor values
+are stimuli; the firmware computes its own readings from them. The patched simulator carries a research
 board model (tools/ucsim-hc11-probe.patch) whose memory map and registers are
 documented hypotheses for two identified files only; any CPU access it does not
 model stops execution. No firmware is patched on disk. See docs/firmware-emulation.md.
@@ -30,7 +31,7 @@ SUPPORTED = {
     "081bc0ede46963f101bab5e6a0a69e9a7babb11bb1122928a815c8f1032da725": "REMAP MILD EURO95 RUNNING.BIN (mild remap)",
 }
 LOOKUP_SHA256 = "6b25c337bcc9308cc838ea93f0c51a4fca2db67b06be6613989d99ecb3a12cdc"
-PROTOCOL = 3
+PROTOCOL = 4
 # 24 rows x stride 9 read by the 0x647E caller; the only bytes a session edit may change.
 TABLE_FIRST, TABLE_LAST = 0x91AB, 0x9282
 MAX_RUN = 2_000_000  # instructions per run request; a session continues from its checkpoint
@@ -44,16 +45,19 @@ BOARD = {
               "unknown, unmodelled effect; an EPROM-address write of the byte already there is dropped (equivalent "
               "whether the board ignores it or shadows it into RAM); any other external access still stops; the SCI "
               "receive line is idle (no diagnostic tester connected)."),
-    "h2": (2, "Simulation profile H2 (H1 plus named hypotheses and supplied raw inputs, engine stopped): $1040/$1050 "
-              "read back the last written value; board input bytes $1060 and $1080, PORTA/PORTD input pins and A/D "
-              "channels AN0-AN7 are the supplied constants; IRQ and XIRQ pins inactive; no input-capture or "
-              "pulse-accumulator edges; SPI and SCI received data unknown (only discarded loads may read it); SCI "
-              "receive line idle; internal EEPROM at $B600-$B7FF (CONFIG EEON=1 inferred) starts with the supplied "
-              "fill byte. Physical meaning of every input is unknown."),
+    "h2": (2, "Simulation profile H2 (H1 plus named hypotheses and supplied raw inputs): $1040/$1050 read back the "
+              "last written value; board input bytes $1060 and $1080, PORTA PA1/PA2 and PORTD input pins and A/D "
+              "channels AN0-AN7 are supplied raw values (changeable at a chunk boundary); a simulated 60-2 crank wheel "
+              "at the commanded speed drives PA7 (pulse accumulator) and PA0 (input capture 3) together, active edge "
+              "falling, as the firmware's own setup implies (wiring unverified); IC1/IC2 pins constant; IRQ and XIRQ "
+              "pins inactive; SPI and SCI received data unknown (only discarded loads may read it); SCI receive line "
+              "idle; internal EEPROM at $B600-$B7FF (CONFIG EEON=1 inferred) starts with the supplied fill byte. "
+              "No engine model: speed is commanded, never computed from throttle or load."),
 }
-INPUT_LIMITS = {"in1060": 255, "in1080": 255, "porta_in": 255, "portd_in": 63, "eeprom_fill": 255}
+INPUT_LIMITS = {"in1060": 255, "in1080": 255, "porta_in": 255, "portd_in": 63, "eeprom_fill": 255, "crank_rpm": 9000}
 # H2 defaults: explicit simulated values, not measurements. PORTD inputs high = idle SCI RxD (PD0) and SS (PD5).
-DEFAULT_INPUTS = {"in1060": 0x00, "in1080": 0x00, "porta_in": 0x00, "portd_in": 0x3F, "eeprom_fill": 0xFF, "adc": [0x80] * 8}
+DEFAULT_INPUTS = {"in1060": 0x00, "in1080": 0x00, "porta_in": 0x00, "portd_in": 0x3F, "eeprom_fill": 0xFF, "crank_rpm": 0,
+                  "adc": [0x80] * 8}
 LOOP_PC = 0xD4A2  # foreground loop head (static disassembly, both supported files)
 REGIONS = [("internal RAM", 0x0000, 0x00FF), ("unmapped", 0x0100, 0x0FFF), ("HC11 registers", 0x1000, 0x103F),
            ("external I/O (unknown)", 0x1040, 0x1FFF), ("external RAM (inferred)", 0x2000, 0x27FF),
@@ -78,6 +82,11 @@ WATCH = [(0xD4A2, "foreground loop head"), (0xD4EC, "periodic work: $B5 bit 0 fo
 SOURCES = ["IRQ", "RTI", "IC1", "IC2", "IC3", "OC1", "OC2", "OC3", "OC4", "OC5", "TOF", "PAOV", "PAI", "SPI", "SCI"]
 VECTORS = [0xFFF2, 0xFFF0, 0xFFEE, 0xFFEC, 0xFFEA, 0xFFE8, 0xFFE6, 0xFFE4, 0xFFE2, 0xFFE0, 0xFFDE, 0xFFDC, 0xFFDA,
            0xFFD8, 0xFFD6]
+# Firmware RAM bytes sampled 64 times per request (static disassembly, both supported files; see docs).
+PROBES = [(0xBB, "period hi"), (0xBC, "period lo"), (0xD1, "rpm hi"), (0xD2, "rpm lo"), (0xD8, "tooth"),
+          (0xD9, "next tooth"), (0xAE, "sync flags"), (0x2003, "AN2 copy"), (0xC6, "AN2 validated"),
+          (0x200F, "AN2 processed"), (0x0E, "AN2 closed endpoint"), (0x0D, "AN2 open endpoint"), (0xAA, "flags $AA"),
+          (0x200A, "AN3 copy"), (0x2093, "sync errors"), (0x2096, "resyncs")]
 STATE_LIMIT = 4 << 20       # decompressed checkpoint
 CHECKPOINT_LIMIT = 1 << 20  # encoded checkpoint in a request
 SIM_TIMEOUT = 20
@@ -324,6 +333,42 @@ CASES = [
     ("STY ext", "18ff2510", dict(y=0, cc=0xD9, mem={0x2510: [1, 1]}), dict(cc=0xD5, mem={0x2510: [0, 0]}), 6),
     ("LDX ,Y", "cdee05", dict(mem={0x2505: [0x80, 0x00]}), dict(x=0x8000, cc=0xD8), 6),
     ("STX ,Y", "cdef05", dict(x=0x8001), dict(cc=0xD8, mem={0x2505: [0x80, 0x01]}), 6),
+    # Crank path (simulated 60-2 wheel, H2): every further opcode the firmware executes with crank edges.
+    ("IDIV remainder >= quotient", "02", dict(b=20, x=7, cc=0xDF), dict(b=6, x=2, cc=0xD8), 41),
+    # Division by zero: quotient $FFFF, C=1; D (the remainder) is indeterminate, so the model keeps it
+    # and marks it unknown: any later read of it stops the run.
+    ("IDIV by zero", "02", dict(b=5, x=0, cc=0xDE), dict(x=0xFFFF, cc=0xD9), 41),
+    ("FDIV", "03", dict(a=0x20, x=0x8000, cc=0xDF), dict(a=0, b=0, x=0x4000, cc=0xD8), 41),
+    ("FDIV remainder >= quotient", "03", dict(b=1, x=0xFFFF, cc=0xDF), dict(b=1, x=1, cc=0xD8), 41),
+    ("TSX", "30", dict(cc=0xDF), dict(x=0x25F1), 3),
+    ("LSRA", "44", dict(a=0x01), dict(a=0, cc=0xD7), 2),
+    ("RORA", "46", dict(a=0x01, cc=0xD1), dict(a=0x80, cc=0xD9), 2),
+    ("RORB", "56", dict(b=0x02, cc=0xDE), dict(b=0x01, cc=0xD0), 2),
+    ("COM ext", "732510", dict(mem={0x2510: [0x0F]}), dict(cc=0xD9, mem={0x2510: [0xF0]}), 6),
+    ("LSR ext", "742510", dict(mem={0x2510: [0x81]}), dict(cc=0xD3, mem={0x2510: [0x40]}), 6),
+    ("ROR ext", "762510", dict(cc=0xD1), dict(cc=0xDA, mem={0x2510: [0x80]}), 6),
+    ("ASL ext", "782510", dict(mem={0x2510: [0xC0]}), dict(cc=0xD9, mem={0x2510: [0x80]}), 6),
+    ("ROL ext", "792510", dict(cc=0xD1, mem={0x2510: [0x40]}), dict(cc=0xDA, mem={0x2510: [0x81]}), 6),
+    ("EORA imm", "88ff", dict(a=0x0F, cc=0xD3), dict(a=0xF0, cc=0xD9), 2),
+    ("SUBA dir", "9050", dict(a=0x10, mem={0x50: [0x11]}), dict(a=0xFF, cc=0xD9), 3),
+    ("SUBD dir", "9350", dict(a=0x80, mem={0x50: [0x00, 0x01]}), dict(a=0x7F, b=0xFF, cc=0xD2), 5),
+    ("SBCA ext", "b22510", dict(cc=0xD1), dict(a=0xFF, cc=0xD9), 4),
+    ("ADCB imm", "c901", dict(b=0x0F, cc=0xD1), dict(b=0x11, cc=0xF0), 2),
+    ("ADDB imm", "cb01", dict(b=0x7F), dict(b=0x80, cc=0xFA), 2),
+    ("ADDB ,X", "eb05", dict(b=0xFF, mem={0x2505: [0x01]}), dict(b=0, cc=0xF5), 4),
+    ("ADDB ext", "fb2510", dict(b=0x01, cc=0xDF, mem={0x2510: [0x02]}), dict(b=0x03, cc=0xD0), 4),
+    ("DEY", "1809", dict(y=1), dict(y=0, cc=0xD4), 4),
+    ("TSY", "1830", dict(), dict(y=0x25F1), 4),
+    ("TYS", "1835", dict(y=0x2580), dict(sp=0x257F), 4),
+    ("CPY imm borrow", "188c2501", dict(), dict(cc=0xD9), 5),
+    ("CPY ext overflow", "18bc2510", dict(y=0x7FFF, mem={0x2510: [0x80, 0x00]}), dict(cc=0xDB), 7),
+    ("LDY dir", "18de50", dict(cc=0xD7, mem={0x50: [0x80, 0x01]}), dict(y=0x8001, cc=0xD9), 5),
+    ("CPD dir", "1a9350", dict(a=0x12, b=0x34, mem={0x50: [0x12, 0x34]}), dict(cc=0xD4), 6),
+    ("CPD ,X", "1aa305", dict(mem={0x2505: [0x00, 0x01]}), dict(cc=0xD9), 7),
+    ("BVC taken", "2810", dict(), dict(pc=0x2412), 3),
+    ("BVC not taken", "2810", dict(cc=0xD2), dict(), 3),
+    ("BVS taken", "2910", dict(cc=0xD2), dict(pc=0x2412), 3),
+    ("BVS not taken", "2910", dict(), dict(), 3),
     # Interrupt response (manual 5.5, Figures 5-3/5-4, CLI and RTI descriptions), simulation profile.
     # Timer overflow pending and enabled; vector $FFDE -> $2420: LDAA #$80; STAA $1025 (clear TOF); RTI.
     ("IRQ entry stacks Y, sets I", "010101", dict(IRQ_PRE, steps=1),
@@ -548,7 +593,7 @@ def parse_state(block):
 IAW8P_HEAD = re.compile(r"IAW8P profile=(\d) cycles=(\d+) inst=(\d+) tcnt=(\d+) cop_services=(\d+) "
                         r"cop_cycle=(\d+) rom_same_writes=(\d+) events=(\d+)$", re.M)
 IAW8P_STOP = re.compile(r"^IAW8P-STOP kind=(\S+) addr=0x([0-9a-f]+) val=(-?\d+) pc=0x([0-9a-f]+) inst=(\d+) why=(.*)$", re.M)
-SAMPLE = re.compile(r"^IAW8P-SAMPLE (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) (\d+)$", re.M)
+SAMPLE = re.compile(r"^IAW8P-SAMPLE (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) \|((?: \d+)*)$", re.M)
 CLKS = re.compile(r"since last reset= [0-9.e+-]+ sec \((\d+) clks\)")
 
 
@@ -561,7 +606,7 @@ def chunks(budget):
 def parse_checkpoint(text):
     """The board model's checkpoint file: CPU registers, RAM, every board field and the event ring."""
     lines = text.split("\n")
-    if lines[0] != "IAW8P-STATE 1" or "end" not in lines:
+    if lines[0] != "IAW8P-STATE 2" or "end" not in lines:
         raise ValueError("Malformed simulator checkpoint")
     state = {"fields": {}, "mem": {}, "ev": []}
     try:
@@ -598,7 +643,7 @@ def input_commands(profile, inputs):
     if profile != "h2":
         return []
     named = [("in1060", inputs["in1060"]), ("in1080", inputs["in1080"]), ("porta_in", inputs["porta_in"]),
-             ("portd_in", inputs["portd_in"]), ("eeprom_fill", inputs["eeprom_fill"])]
+             ("portd_in", inputs["portd_in"]), ("eeprom_fill", inputs["eeprom_fill"]), ("crank_rpm", inputs["crank_rpm"])]
     named += [(f"adc{k}", v) for k, v in enumerate(inputs["adc"])]
     return [f"iaw8p_{name}={value}" for name, value in named]
 
@@ -612,9 +657,10 @@ def board_trace(simulator, data, profile, budget, inputs, state):
                 *input_commands(profile, inputs)]
     if state is not None:
         commands.append('set hardware iaw8p load "{dir}/in.state"')
-    commands += [f"expr {MARK}*1000", "state", "set hardware iaw8p sample"]
+    sample = 'set hardware iaw8p sample "' + ",".join(f"{a:x}" for a, _ in PROBES) + '"'
+    commands += [f"expr {MARK}*1000", "state", sample]
     for k, size in enumerate(chunks(budget), 1):
-        commands += [f"step {size}", f"expr {MARK}*1000+{k}", "set hardware iaw8p sample"]
+        commands += [f"step {size}", f"expr {MARK}*1000+{k}", sample]
     commands += [f"expr {MARK}*1000+498", "state", 'set hardware iaw8p save "{dir}/out.state"',
                  f"expr {MARK}*1000+499", "info registers", "info hardware iaw8p"]
     output, saved = run_simulator(simulator, data, commands, state)
@@ -629,8 +675,11 @@ def board_trace(simulator, data, profile, budget, inputs, state):
         m = SAMPLE.search(blocks.get(f"{k:03d}", ""))
         if not m:
             raise ValueError(f"Malformed simulator sample {k}:\n" + blocks.get(f"{k:03d}", "")[-2000:])
-        inst, cycles, pc, sp, a, b, x, y, cc = map(int, m.groups())
-        samples.append({"inst": inst, "cycles": cycles, "pc": pc,
+        inst, cycles, pc, sp, a, b, x, y, cc, edges, pos = map(int, m.groups()[:11])
+        probe = [int(v) for v in m[12].split()]
+        if len(probe) != len(PROBES):
+            raise ValueError(f"Malformed simulator sample {k}: probe bytes missing")
+        samples.append({"inst": inst, "cycles": cycles, "pc": pc, "crank_edges": edges, "crank_pos": pos, "probe": probe,
                         "registers": {"pc": pc, "sp": sp, "a": a, "b": b, "x": x, "y": y, "cc": cc}})
     clks = [CLKS.search(blocks.get("000", "")), CLKS.search(blocks.get("498", ""))]
     report = blocks.get("499", "")
@@ -689,6 +738,14 @@ def unseal(sha, profile, inputs, checkpoint):
     return raw.decode("ascii")
 
 
+def crank_state(f, inputs):
+    """The simulated crank signal (stimulus side, not a firmware reading)."""
+    pos = f["crank_pos"][0]
+    return {"rpm": inputs["crank_rpm"], "edges": f["crank_edges"][0], "rises": f["crank_rises"][0], "position": pos,
+            "tooth": pos // 2 + 1 if pos < 116 else None, "level": f["crank_level"][0], "residual": f["crank_acc"][0],
+            "pacnt": f["reg"][0x27], "tic3": f["tic"][2] if f["tic_valid"][0] & 4 else None}
+
+
 def describe(trace, data, profile, inputs, start, budget):
     """Response fields for the GUI, all from the checkpoint after the last executed instruction."""
     st, f = trace["state"], trace["state"]["fields"]
@@ -735,16 +792,39 @@ def describe(trace, data, profile, inputs, start, budget):
         "loop": {"pc": LOOP_PC, "count": loop_n, "sp_min": f["loop_sp_min"][0] if loop_n else None,
                  "sp_max": f["loop_sp_max"][0] if loop_n else None, "gap_max": f["loop_gap_max"][0]},
         "outputs": {"porta_latch": f["pa_latch"][0], "porta_pins": f["pa_pins"][0], "porta_changes": f["pa_changes"],
+                    "porta_high_cycles": f["pa_high_w"], "porta_low_cycles": f["pa_low_w"],
+                    "latch_changes": f["latch_changes"],
                     "spi_bytes": f["spi_n"][0], "spi_last": last(f["spi_last"], f["spi_n"][0]),
                     "sci_bytes": f["sci_n"][0], "sci_last": last(f["sci_last"], f["sci_n"][0])},
         "eeprom": {"init": bool(f["ee_init"][0]), "ops": f["ee_ops"][0], "bytes": bytes(f["ee"]).hex()}
         if profile == "h2" else None,
         "ram": {"internal": st["mem"][0].hex(), "external": st["mem"][0x2000].hex()},
+        # Per sample: instruction, E cycle, crank falling edges so far, then the PROBES bytes.
+        "trace": [[s["inst"], s["cycles"], s["crank_edges"], *s["probe"]] for s in trace["samples"]],
+        "probes": [[a, name] for a, name in PROBES],
+        "crank": crank_state(f, inputs) if profile == "h2" else None,
         "inputs": inputs,
     }
 
 
-def run(simulator, data, profile, budget, inputs=None, checkpoint=None, sha=None):
+# Inputs fixed for a whole session: the EEPROM fill only matters at its first access after reset.
+SESSION_INPUTS = {"eeprom_fill"}
+
+
+def changed_inputs(profile, before, after):
+    """Names of H2 inputs that differ between a checkpoint's inputs and the next request's."""
+    if profile != "h2":
+        if before is not None or after is not None:
+            raise ValueError("inputs are only accepted by the h2 simulation profile")
+        return []
+    changed = sorted(k for k in after if before[k] != after[k])
+    fixed = [k for k in changed if k in SESSION_INPUTS]
+    if fixed:
+        raise ValueError(f"{', '.join(fixed)} cannot change during a session; reset the session")
+    return changed
+
+
+def run(simulator, data, profile, budget, inputs=None, checkpoint=None, sha=None, checkpoint_inputs=None):
     """Continue a session for at most `budget` instructions under one board profile.
 
     Without a checkpoint the session starts at reset. When an instruction would need unmodelled
@@ -753,7 +833,12 @@ def run(simulator, data, profile, budget, inputs=None, checkpoint=None, sha=None
     through checkpoints executes exactly like one long run (see the tests).
     """
     sha = sha or hashlib.sha256(data).hexdigest()
-    state = unseal(sha, profile, inputs, checkpoint) if checkpoint is not None else None
+    # A checkpoint is verified against the inputs it was sealed with; changed inputs take effect at
+    # its instruction boundary (the next A/D conversion, crank edge or port read) and the new
+    # checkpoint is sealed with the new inputs.
+    before = inputs if checkpoint_inputs is None else checkpoint_inputs
+    changed = changed_inputs(profile, before, inputs) if checkpoint is not None else []
+    state = unseal(sha, profile, before, checkpoint) if checkpoint is not None else None
     start = parse_checkpoint(state)["inst"] if state is not None else 0
 
     def trace_for(n):
@@ -777,6 +862,7 @@ def run(simulator, data, profile, budget, inputs=None, checkpoint=None, sha=None
         blocker.update(pc=final["pc"], bytes=trace["next"]["bytes"], text=trace["next"]["text"])
         del blocker["inst"]
     return {**describe(trace, data, profile, inputs, start, budget), "executed": executed, "blocker": blocker,
+            "inputs_changed": changed,
             "checkpoint": None if blocker else seal(sha, profile, inputs, trace["text"])}
 
 
@@ -824,7 +910,7 @@ def lookup(simulator, data, row, column, row_fraction, column_fraction, edits):
 # --- JSON bridge ------------------------------------------------------------------
 
 COMMON = {"version", "action", "simulator", "sha256", "image"}
-FIELDS = {"run": COMMON | {"profile", "budget", "inputs", "checkpoint"},
+FIELDS = {"run": COMMON | {"profile", "budget", "inputs", "checkpoint", "checkpoint_inputs"},
           "lookup": COMMON | {"row", "column", "row_fraction", "column_fraction", "edits"}}
 
 
@@ -848,6 +934,8 @@ def validate_inputs(profile, inputs):
     adc = inputs["adc"]
     if not isinstance(adc, list) or len(adc) != 8 or any(type(v) is not int or not 0 <= v <= 255 for v in adc):
         raise ValueError("adc must be 8 raw A/D results 0..255 (channels AN0..AN7)")
+    if inputs["porta_in"] & 0x81:
+        raise ValueError("porta_in bits 0 and 7 must be 0: in h2, PA0 and PA7 carry the simulated crank signal")
     return inputs
 
 
@@ -866,6 +954,10 @@ def handle(request):
             raise ValueError(f"profile must be one of {sorted(BOARD)}")
         params = (request["profile"], integer(request, "budget", 0, MAX_RUN),
                   validate_inputs(request["profile"], request["inputs"]), request["checkpoint"])
+        if (request["checkpoint"] is None) != (request["checkpoint_inputs"] is None) and request["profile"] == "h2":
+            raise ValueError("checkpoint_inputs must accompany a checkpoint (the inputs it was sealed with), and only then")
+        before = request["checkpoint_inputs"]
+        before = None if before is None else validate_inputs(request["profile"], before)
     else:
         edits = request["edits"]
         if not isinstance(edits, list) or len(edits) > TABLE_LAST - TABLE_FIRST + 1:
@@ -886,7 +978,7 @@ def handle(request):
         raise ValueError("sha256 does not match the image")
     check_source(data)
     if request["action"] == "run":
-        result = run(request["simulator"], data, *params, sha=sha)
+        result = run(request["simulator"], data, *params, sha=sha, checkpoint_inputs=before)
     else:
         result = lookup(request["simulator"], data, *params)
     return {"version": PROTOCOL, "ok": True, "action": request["action"], "sha256": sha,

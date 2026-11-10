@@ -9,10 +9,16 @@ UCSIM ?= $(UCSIM_SRC)/src/sims/m68hc11.src/ucsim_m68hc11
 # The simulator's own makefiles must not inherit this project's variables (DIR, UCSIM, ...).
 SUBMAKE := env -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES make
 
-.PHONY: build check test run report firmware-probe emulator-setup
+.PHONY: build check test run report firmware-probe emulator-setup emulator-conformance release-package
 
 build:
 	cargo build --locked --release
+
+emulator-conformance:
+	PYTHONPATH=tools UCSIM="$(UCSIM)" python3 -B -c 'import os, firmware_probe as f; f.run_simulator(os.environ["UCSIM"], bytes(65536), []); print(f"Passed {len(f.CASES)} simulator conformance cases")'
+
+release-package: build emulator-setup
+	python3 -B tools/package_release.py
 
 check:
 	cargo check --locked
@@ -20,7 +26,7 @@ check:
 
 # Simulator tests in tools/ are skipped when UCSIM or the identified dumps are missing.
 test:
-	cargo test --locked
+	DUMP_DIR="$(DIR)" cargo test --locked
 	UCSIM="$(UCSIM)" DUMP_DIR="$(DIR)" python3 -B -m unittest discover -s tools -t tools
 
 run: build
