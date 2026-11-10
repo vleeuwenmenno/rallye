@@ -541,7 +541,12 @@ impl Render for Rallye {
                     .flex_1()
                     .min_h_0()
                     .child(self.sidebar(cx))
-                    .child(div().id("main").flex_1().min_w_0().overflow_y_scroll().p_4().child(if self.emulation { self.emulation(cx) } else { self.main(w.viewport_size(), cx) })),
+                    // Emulation brings its own fixed toolbar, scrolling pane and status bar.
+                    .child(if self.emulation {
+                        self.emulation(w, cx).flex_1().min_w_0().into_any_element()
+                    } else {
+                        div().id("main").flex_1().min_w_0().overflow_y_scroll().p_4().child(self.main(w.viewport_size(), cx)).into_any_element()
+                    }),
             );
         if let Some(c) = self.confirm {
             root = root.child(self.confirm_modal(c, cx));
@@ -553,7 +558,7 @@ impl Render for Rallye {
 impl Rallye {
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let col = div()
-            .w(px(330.))
+            .w(px(if self.emulation { 270. } else { 330. }))
             .flex_none()
             .flex()
             .flex_col()
@@ -582,12 +587,15 @@ impl Rallye {
         let t_opts = (0..inv.dumps.len()).map(|i| (Some(i), name(i), i == self.target)).collect();
         let mut b_opts = vec![(None, "None (no comparison)".to_string(), self.baseline.is_none())];
         b_opts.extend((0..inv.dumps.len()).map(|i| (Some(i), name(i), self.baseline == Some(i))));
-        src = src
-            .child(self.selector(cx, Menu::Target, "TARGET DUMP · session working copy", Some(self.target).filter(|&t| t < inv.dumps.len()).map_or("—".into(), name), tgt.map(info), t_opts))
-            .child(self.selector(cx, Menu::Baseline, "BASELINE DUMP · original, unedited", self.baseline.filter(|&b| b < inv.dumps.len()).map_or("None".into(), name), base.map(info), b_opts));
+        src = src.child(self.selector(cx, Menu::Target, "TARGET DUMP · session working copy", Some(self.target).filter(|&t| t < inv.dumps.len()).map_or("—".into(), name), tgt.map(info), t_opts));
         for e in &inv.errors {
             src = src.child(msg(format!("rejected: {e}"), ERR));
         }
+        // Emulation runs only the target; baseline, XDF and the table list belong to the Maps tab.
+        if self.emulation {
+            return col.child(src).child(div().id("emu-nav").flex_1().min_h_0().overflow_y_scroll().child(self.emu_nav(cx)));
+        }
+        src = src.child(self.selector(cx, Menu::Baseline, "BASELINE DUMP · original, unedited", self.baseline.filter(|&b| b < inv.dumps.len()).map_or("None".into(), name), base.map(info), b_opts));
         if inv.xdfs.is_empty() {
             src = src.child(msg("No .xdf loaded.".into(), WARN));
         }
